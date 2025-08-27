@@ -1,5 +1,5 @@
 // src/config/bullmq.ts
-import { Queue, QueueEvents, Worker, QueueOptions, WorkerOptions } from 'bullmq';
+import { Queue, QueueEvents, QueueOptions } from 'bullmq';
 import { PROCESSING_QUEUE_NAME, NODE_ENV } from './env';
 import { redis } from './redis';
 import logger from '../utils/logger';
@@ -17,33 +17,32 @@ const queueOptions: QueueOptions = {
   },
 };
 
-const workerOptions: WorkerOptions = {
-  connection: redis,
-  stalledInterval: 30 * 1000,
-  maxStalledCount: 1,
-};
-
+// ✅ Only create the queue - NO WORKER HERE
 export const imageQueue = new Queue(PROCESSING_QUEUE_NAME, queueOptions);
 
-export const imageWorker = new Worker(
-  PROCESSING_QUEUE_NAME,
-  async (job) => {
-    logger.info(`Processing job ${job.id} of type ${job.name}`);
-  },
-  workerOptions
-);
-
+// ✅ Keep the queue events for monitoring
 const imageQueueEvents = new QueueEvents(PROCESSING_QUEUE_NAME, { connection: redis });
 
 imageQueueEvents.on('error', (error) => {
   logger.error('Queue error', { error: error.message, stack: error.stack });
 });
+
 imageQueueEvents.on('waiting', ({ jobId }) => {
   logger.debug('Job waiting:', { jobId });
 });
+
 imageQueueEvents.on('active', ({ jobId }) => {
   logger.info('Job started:', { jobId });
 });
+
+imageQueueEvents.on('completed', ({ jobId, returnvalue }) => {
+  logger.info('Job completed:', { 
+    // jobId, 
+    // outputPath: returnvalue?.outputPath,
+    // processingTime: returnvalue?.processingTime 
+  });
+});
+
 imageQueueEvents.on('failed', async ({ jobId, failedReason }) => {
   const job = await imageQueue.getJob(jobId);
   logger.error('Job failed:', {
@@ -53,10 +52,12 @@ imageQueueEvents.on('failed', async ({ jobId, failedReason }) => {
     maxAttempts: job?.opts.attempts,
   });
 });
+
 imageQueueEvents.on('stalled', ({ jobId }) => {
   logger.warn('Job stalled:', { jobId });
 });
 
+// ✅ Export interfaces and enums as before
 export interface CropOperation {
   x: number;
   y: number;
@@ -71,6 +72,29 @@ export interface ResizeOperation {
   position?: 'center' | 'top' | 'right' | 'bottom' | 'left';
 }
 
+export type watermark = |{
+  type: "text";
+      text: string;
+      fontSize?: number;
+      fontFamily?: string;
+      color?: string;   // e.g. "#FFFFFF"
+      opacity?: number; // 0 to 1
+      gravity?: "north" | "south" | "east" | "west" | "center"; 
+      dx?: number; // x offset
+      dy?: number; // y offset
+}
+|{
+  type: "image";
+      imagePath: string; // path to the watermark image
+      width?: number;    // optional resize
+      height?: number;
+      opacity?: number; 
+      gravity?: "north" | "south" | "east" | "west" | "center"; 
+      dx?: number;
+      dy?: number;
+
+}
+
 export const SUPPORTED_FORMATS = ['jpeg', 'png', 'webp', 'avif'] as const;
 export type SupportedFormat = typeof SUPPORTED_FORMATS[number];
 
@@ -83,6 +107,21 @@ export interface ImageOperations {
   grayscale?: boolean;
   blur?: number;
   sharpen?: number;
+  flip?:boolean,
+  flop?:boolean,
+  brightness?:number,
+    saturation?: number;   
+  hue?: number;          
+  contrast?: number;    
+  gamma?: number;        
+  negate?: boolean;      
+  normalize?: boolean;   
+  sepia?: boolean;
+  watermark?:watermark;
+   progressive?: boolean;     
+  compression?: number;      
+  lossless?: boolean;        
+
 }
 
 export interface ImageJobPayload {

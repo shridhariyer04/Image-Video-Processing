@@ -1,4 +1,3 @@
-// src/server.ts
 import app from './app';
 import { PORT } from './config/env';
 import logger from './utils/logger';
@@ -41,13 +40,13 @@ async function startServer() {
 
     console.log('🌐 Step 3: Starting Express server...');
     
-    // Start the Express server
+    // Start the Express server - Fixed: app is now Express Application, not Router
     const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`🎉 SERVER IS RUNNING!`);
       console.log(`🔗 URL: http://localhost:${PORT}`);
       console.log(`🏥 Health check: http://localhost:${PORT}/health`);
       console.log(`📁 Upload endpoint: http://localhost:${PORT}/upload`);
-      console.log(`📊 Worker stats: http://localhost:${PORT}/worker/stats`);
+      console.log(`📊 Worker stats: http://localhost:${PORT}/upload/worker/stats`);
       
       logger.info(`Server started successfully`, {
         port: PORT,
@@ -56,9 +55,9 @@ async function startServer() {
         endpoints: {
           upload: '/upload',
           health: '/health',
-          jobStatus: '/job/:jobId/status',
-          jobDownload: '/job/:jobId/download',
-          workerStats: '/worker/stats'
+          jobStatus: '/upload/job/:jobId/status',
+          jobDownload: '/upload/job/:jobId/download',
+          workerStats: '/upload/worker/stats'
         }
       });
     });
@@ -76,12 +75,12 @@ async function startServer() {
       process.exit(1);
     });
 
-    // Handle graceful shutdown - ONLY handle it here, not in the worker
+    // Handle graceful shutdown - Fixed: Added proper typing for err parameter
     const gracefulShutdown = async (signal: string) => {
       console.log(`📴 ${signal} received, starting graceful shutdown...`);
       
-      // Close server first
-      server.close(async (err) => {
+      // Close server first - Fixed: Added proper type annotation
+      server.close(async (err: Error | undefined) => {
         if (err) {
           console.error('Error closing server:', err);
           process.exit(1);

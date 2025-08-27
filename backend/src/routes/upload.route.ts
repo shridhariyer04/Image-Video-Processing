@@ -6,6 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import { AppError } from '../utils/error';
 import logger from '../utils/logger';
+import { generateRecommendations } from '../utils/Helper';
 
 const router = express.Router();
 
@@ -97,14 +98,25 @@ router.get('/job/:jobId/download', async (req: Request, res: Response, next: Nex
       throw new AppError('Processed file not found', 404, 'FILE_NOT_FOUND');
     }
 
-    // Check if file exists using the worker's method
-    const fileCheck = await imageWorker.checkProcessedFile(jobId);
+    // Check if file exists using direct fs methods since worker doesn't have checkProcessedFile
+    let filePath: string;
+    let fileSize: number;
     
-    if (!fileCheck.exists || !fileCheck.filePath) {
-      throw new AppError('Processed file not found on disk', 404, 'FILE_NOT_FOUND');
+    try {
+      const stats = await fs.promises.stat(jobStatus.outputPath);
+      filePath = jobStatus.outputPath;
+      fileSize = stats.size;
+      
+      if (fileSize === 0) {
+        throw new AppError('Processed file is empty', 404, 'FILE_EMPTY');
+      }
+    } catch (error: any) {
+      if (error.code === 'ENOENT') {
+        throw new AppError('Processed file not found', 404, 'FILE_NOT_FOUND');
+      }
+      throw error;
     }
 
-    const filePath = fileCheck.filePath;
     const fileName = jobStatus.processedFileName || `processed-${jobId}.jpg`;
 
     // Determine content type based on file extension
@@ -138,7 +150,7 @@ router.get('/job/:jobId/download', async (req: Request, res: Response, next: Nex
 
     // Set response headers
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Length', fileCheck.fileSize || 0);
+    res.setHeader('Content-Length', fileSize);
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
     res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
     res.setHeader('Expires', '-1');
@@ -149,7 +161,7 @@ router.get('/job/:jobId/download', async (req: Request, res: Response, next: Nex
       filePath,
       fileName,
       contentType,
-      fileSize: fileCheck.fileSize
+      fileSize
     });
 
     // Stream the file
@@ -211,7 +223,26 @@ router.get('/jobs/status', async (req: Request, res: Response, next: NextFunctio
 
     logger.debug('Getting bulk job statuses:', { jobIds: jobIdArray });
 
-    const jobStatuses = await imageWorker.getJobStatuses(jobIdArray);
+    // Since worker doesn't have getJobStatuses method, get them individually
+    const jobStatuses: { [key: string]: any } = {};
+    
+    for (const jobId of jobIdArray) {
+      try {
+        const status = await imageWorker.getJobStatus(jobId);
+        jobStatuses[jobId] = status ? {
+          success: true,
+          data: status
+        } : {
+          success: false,
+          error: 'Job not found'
+        };
+      } catch (error) {
+        jobStatuses[jobId] = {
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        };
+      }
+    }
 
     const response = {
       success: true,
@@ -251,6 +282,89 @@ router.get('/worker/stats', async (req: Request, res: Response, next: NextFuncti
       error: error instanceof Error ? error.message : error
     });
     next(error);
+  }
+});
+
+// GET /diagnose - Queue diagnosis endpoint  
+router.get('/diagnose', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Since worker doesn't have diagnoseQueue method, create a basic diagnosis
+    const stats = imageWorker.getStats();
+    const health = await imageWorker.getHealthStatus();
+    
+    const diagnosis = {
+      timestamp: new Date().toISOString(),
+      uptime: Date.now() - stats.startTime,
+      stats,
+      queueHealth: health.queueHealth,
+      memoryUsage: health.memoryUsage,
+      issues: [] as string[],
+      recommendations: [] as string[]
+    };
+
+    // Add basic health checks
+    if (health.queueHealth.failed > health.queueHealth.completed) {
+      diagnosis.issues.push('High failure rate detected');
+      diagnosis.recommendations.push('Check error logs for recurring issues');
+    }
+
+    if (health.queueHealth.waiting > 100) {
+      diagnosis.issues.push('Large queue backlog');
+      diagnosis.recommendations.push('Consider increasing worker concurrency');
+    }
+
+    if (health.memoryUsage.heapUsed > 500 * 1024 * 1024) { // 500MB
+      diagnosis.issues.push('High memory usage');
+      diagnosis.recommendations.push('Monitor memory leaks and restart if necessary');
+    }
+
+    res.json({
+      success: true,
+      data: {
+        diagnosis,
+        recommendations: generateRecommendations ? generateRecommendations(diagnosis) : diagnosis.recommendations
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Error generating diagnosis:', {
+      error: error instanceof Error ? error.message : error
+    });
+    next(error);
+  }
+});
+
+// GET /health - Health check endpoint
+router.get('/health', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const health = await imageWorker.getHealthStatus();
+    
+    res.json({
+      success: true,
+      status: health.status,
+      data: {
+        uptime: health.uptime,
+        stats: health.stats,
+        queue: health.queueHealth,
+        memory: {
+          used: Math.round(health.memoryUsage.heapUsed / 1024 / 1024),
+          total: Math.round(health.memoryUsage.heapTotal / 1024 / 1024),
+          external: Math.round(health.memoryUsage.external / 1024 / 1024)
+        }
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Error getting health status:', {
+      error: error instanceof Error ? error.message : error
+    });
+    
+    res.status(500).json({
+      success: false,
+      status: 'unhealthy',
+      error: error instanceof Error ? error.message : 'Unknown error',
+      timestamp: new Date().toISOString()
+    });
   }
 });
 

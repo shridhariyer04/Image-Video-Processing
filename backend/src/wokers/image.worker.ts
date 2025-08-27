@@ -1,9 +1,9 @@
 import { Worker, Job, UnrecoverableError } from 'bullmq';
-import { imageQueue, ImageJobPayload, ImageJobType } from '../config/bullmq';
+import { imageQueue, ImageJobPayload, ImageJobType, watermark } from '../config/bullmq';
 import { redis } from '../config/redis';
 import { ImageProcessor, ProcessingResult } from '../processors/ImageProcessor';
 import { NODE_ENV, PROCESSING_QUEUE_NAME } from '../config/env';
-import { IMAGE_CONFIG, ImageConfigUtils } from '../config/image.config';
+import { IMAGE_CONFIG } from '../config/image.config';
 import { FileValidationService } from '../service/validationservice';
 import { AppError, ValidationError } from '../utils/error';
 import logger from '../utils/logger';
@@ -29,7 +29,7 @@ interface ImageOperations {
   flip?: boolean;
   flop?: boolean;
   blur?: number;
-  sharpen?: number; // Standardized to number | undefined
+  sharpen?: number;
   brightness?: number;
   contrast?: number;
   saturation?: number;
@@ -69,20 +69,18 @@ interface JobStatusResponse {
   failedReason?: string;
 }
 
-// Worker configuration using centralized config
+// Worker configuration
 const WORKER_CONFIG = {
-  concurrency: NODE_ENV === 'production' 
-    ? IMAGE_CONFIG.WORKER.CONCURRENCY.PRODUCTION 
-    : IMAGE_CONFIG.WORKER.CONCURRENCY.DEVELOPMENT,
+  concurrency: NODE_ENV === 'production' ? 2 : 1,
   maxStalledCount: 1,
-  stalledInterval: IMAGE_CONFIG.WORKER.TIMEOUTS.STALLED_INTERVAL,
+  stalledInterval: 30000,
   removeOnComplete: { 
-    count: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_COMPLETED_JOBS, 
-    age: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.COMPLETED_JOB_AGE 
+    count: 100, 
+    age: 24 * 60 * 60 * 1000 // 24 hours
   },
   removeOnFail: { 
-    count: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_FAILED_JOBS, 
-    age: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.FAILED_JOB_AGE 
+    count: 50, 
+    age: 7 * 24 * 60 * 60 * 1000 // 7 days
   },
 };
 
@@ -95,6 +93,7 @@ interface WorkerStats {
   averageProcessingTime: number;
   activeJobs: number;
   lastProcessedAt?: number;
+  filesCleanedUp: number;
 }
 
 // Health check interface
@@ -108,8 +107,15 @@ interface HealthStatus {
     active: number;
     completed: number;
     failed: number;
-    stalled: number;
   };
+}
+
+// Simple cleanup tracking
+interface CleanupFile {
+  filePath: string;
+  scheduledAt: number;
+  jobId: string;
+  reason: string;
 }
 
 class ImageWorker extends EventEmitter {
@@ -118,6 +124,10 @@ class ImageWorker extends EventEmitter {
   private isShuttingDown = false;
   private healthCheckInterval?: NodeJS.Timeout;
   private cleanupInterval?: NodeJS.Timeout;
+  
+  // Simple cleanup queue - no complex reference counting
+  private cleanupQueue: Set<string> = new Set();
+  private processedFiles: Map<string, { jobId: string; processedAt: number }> = new Map();
 
   constructor() {
     super();
@@ -129,6 +139,7 @@ class ImageWorker extends EventEmitter {
       totalProcessingTime: 0,
       averageProcessingTime: 0,
       activeJobs: 0,
+      filesCleanedUp: 0,
     };
 
     this.worker = new Worker(
@@ -141,32 +152,472 @@ class ImageWorker extends EventEmitter {
         removeOnFail: WORKER_CONFIG.removeOnFail,
         maxStalledCount: WORKER_CONFIG.maxStalledCount,
         stalledInterval: WORKER_CONFIG.stalledInterval,
-        autorun: false,
+        autorun: true,
       }
     );
 
     this.setupEventHandlers();
     this.setupHealthCheck();
-    this.setupCleanupScheduler();
+    this.setupSimpleCleanup();
   }
 
   /**
-   * Get job status by job ID - NEW METHOD
+   * Main job processing function - SIMPLIFIED
+   */
+
+private async processJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
+  const jobStartTime = performance.now();
+  this.stats.activeJobs++;
+
+  console.log('🚀 === JOB PROCESSING START ===');
+  console.log('🔍 Job ID:', job.id);
+  console.log('📝 Job Name:', job.name);
+  console.log('📁 File Path:', job.data.filePath);
+  console.log('👤 Job Data:', {
+    originalName: job.data.originalName,
+    fileSize: job.data.fileSize,
+    mimeType: job.data.mimeType,
+    operations: job.data.operations ? Object.keys(job.data.operations) : 'none'
+  });
+  console.log('===============================');
+
+  try {
+    console.log('🔄 [STEP 1] Validating input file exists...');
+    // Validate input file exists
+    await this.validateFileExists(job.data.filePath);
+    console.log('✅ [STEP 1] File exists validation passed');
+
+    console.log('🔄 [STEP 2] Logging job start...');
+    logger.info('Processing image job started:', {
+      jobId: job.id,
+      jobType: job.name,
+      filename: job.data.originalName,
+      fileSize: `${Math.round(job.data.fileSize / 1024)}KB`,
+      operations: job.data.operations ? Object.keys(job.data.operations) : [],
+      attempt: job.attemptsMade + 1,
+    });
+    console.log('✅ [STEP 2] Job logging completed');
+
+    console.log('🔄 [STEP 3] Emitting job started event...');
+    this.emit('jobStarted', { jobId: job.id, jobData: job.data });
+    console.log('✅ [STEP 3] Event emitted');
+    
+    console.log('🔄 [STEP 4] Updating progress to 10%...');
+    await this.updateProgress(job, 10);
+    console.log('✅ [STEP 4] Progress updated');
+
+    console.log('🔄 [STEP 5] Validating job data...');
+    // Validate job data
+    await this.validateJobData(job.data);
+    console.log('✅ [STEP 5] Job data validation passed');
+
+    console.log('🔄 [STEP 6] Updating progress to 30%...');
+    await this.updateProgress(job, 30);
+    console.log('✅ [STEP 6] Progress updated');
+
+    console.log('🔄 [STEP 7] *** STARTING IMAGE PROCESSING ***');
+    console.log('📊 Processing details:', {
+      inputPath: job.data.filePath,
+      operations: job.data.operations,
+      fileSize: job.data.fileSize,
+      mimeType: job.data.mimeType
+    });
+    
+    // Process the image
+    const result = await this.processImageJob(job);
+    console.log('✅ [STEP 7] *** IMAGE PROCESSING COMPLETED ***');
+    console.log('📄 Result:', {
+      outputPath: result.outputPath,
+      originalSize: result.originalSize,
+      processedSize: result.processedSize,
+      operations: result.operations
+    });
+
+    console.log('🔄 [STEP 8] Updating progress to 90%...');
+    await this.updateProgress(job, 90);
+    console.log('✅ [STEP 8] Progress updated');
+
+    console.log('🔄 [STEP 9] Scheduling file cleanup...');
+    // Schedule original file for cleanup AFTER successful processing
+    this.scheduleFileForCleanup(job.data.filePath, job.id as string, 'job_completed');
+    console.log('✅ [STEP 9] File scheduled for cleanup');
+
+    console.log('🔄 [STEP 10] Final progress update to 100%...');
+    await this.updateProgress(job, 100);
+    console.log('✅ [STEP 10] Final progress updated');
+
+    console.log('🔄 [STEP 11] Calculating final metrics...');
+    const processingTime = performance.now() - jobStartTime;
+    result.processingTime = processingTime;
+    this.updateStats(processingTime, true);
+
+    // Track processed file
+    this.processedFiles.set(job.data.filePath, {
+      jobId: job.id as string,
+      processedAt: Date.now()
+    });
+    console.log('✅ [STEP 11] Metrics calculated and stats updated');
+
+    console.log('🎉 === JOB COMPLETED SUCCESSFULLY ===');
+    console.log('🆔 Job ID:', job.id);
+    console.log('⏱️  Processing Time:', `${processingTime.toFixed(2)}ms`);
+    console.log('📤 Output Path:', result.outputPath);
+    console.log('📊 Final Stats:', {
+      originalSize: `${Math.round(result.originalSize / 1024)}KB`,
+      processedSize: `${Math.round(result.processedSize / 1024)}KB`,
+      compressionRatio: `${Math.round((1 - result.processedSize / result.originalSize) * 100)}%`,
+      operations: result.operations
+    });
+    console.log('=================================');
+
+    logger.info('Image job completed successfully:', {
+      jobId: job.id,
+      filename: job.data.originalName,
+      outputPath: result.outputPath,
+      processingTime: `${processingTime.toFixed(2)}ms`,
+    });
+
+    console.log('🔄 [STEP 12] Emitting completion event...');
+    this.emit('jobCompleted', { jobId: job.id, result, processingTime });
+    console.log('✅ [STEP 12] Completion event emitted');
+
+    return result;
+
+  } catch (error) {
+    const processingTime = performance.now() - jobStartTime;
+    this.updateStats(processingTime, false);
+    
+    console.log('💥 === JOB FAILED ===');
+    console.log('🆔 Job ID:', job.id);
+    console.log('❌ Error:', error);
+    console.log('🔍 Error Details:', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : 'No stack trace',
+      name: error instanceof Error ? error.name : 'Unknown'
+    });
+    console.log('🔄 Is Recoverable:', this.isRecoverableError(error));
+    console.log('📊 Attempt Info:', {
+      currentAttempt: job.attemptsMade + 1,
+      maxAttempts: job.opts.attempts || 3
+    });
+    console.log('==================');
+    
+    const isRecoverable = this.isRecoverableError(error);
+    const isFinalFailure = !isRecoverable || (job.attemptsMade + 1) >= (job.opts.attempts || 3);
+    
+    // Only schedule cleanup on final failure
+    if (isFinalFailure) {
+      console.log('🚨 Final failure - scheduling file cleanup');
+      this.scheduleFileForCleanup(
+        job.data.filePath, 
+        job.id as string, 
+        isRecoverable ? 'max_retries_exceeded' : 'unrecoverable_error'
+      );
+    } else {
+      console.log('⚠️ Recoverable error - keeping file for retry');
+    }
+    
+    logger.error('Image job processing failed:', {
+      jobId: job.id,
+      filename: job.data.originalName,
+      error: error instanceof Error ? error.message : error,
+      errorStack: error instanceof Error ? error.stack : undefined,
+      isRecoverable,
+      isFinalFailure,
+      attempt: job.attemptsMade + 1,
+      processingTime: `${processingTime.toFixed(2)}ms`
+    });
+
+    this.emit('jobFailed', { 
+      jobId: job.id, 
+      error, 
+      isRecoverable, 
+      isFinalFailure,
+    });
+
+    if (!isRecoverable) {
+      throw new UnrecoverableError(
+        error instanceof Error ? error.message : 'Unrecoverable processing error'
+      );
+    }
+
+    throw error;
+  } finally {
+    this.stats.activeJobs--;
+    console.log('🔄 Job finally block - active jobs decremented to:', this.stats.activeJobs);
+  }
+}
+
+  /**
+   * Simple file validation
+   */
+  private async validateFileExists(filePath: string): Promise<void> {
+    try {
+      await fs.access(filePath);
+      console.log('✅ Input file exists:', filePath);
+    } catch (error) {
+      console.error('❌ Input file missing:', filePath);
+      throw new UnrecoverableError(`Input file not found: ${filePath}`);
+    }
+  }
+
+  /**
+   * Safe progress update
+   */
+  private async updateProgress(job: Job<ImageJobPayload>, progress: number): Promise<void> {
+    try {
+      await job.updateProgress(progress);
+      console.log(`✅ Progress updated to ${progress}%`);
+    } catch (error) {
+      console.warn(`⚠️ Failed to update progress to ${progress}%:`, error);
+    }
+  }
+
+  /**
+   * Process image job - SIMPLIFIED
+   */
+  private async processImageJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
+    console.log('=== PROCESSING IMAGE JOB ===');
+    console.log('Input Path:', job.data.filePath);
+    console.log('Operations:', JSON.stringify(job.data.operations, null, 2));
+    
+    try {
+      // Verify input file
+      const inputStats = await fs.stat(job.data.filePath);
+      console.log('✅ Input file verified. Size:', inputStats.size, 'bytes');
+
+      const outputFormat = job.data.operations?.format || 'jpeg';
+      const outputDir = IMAGE_CONFIG.PROCESSED_DIR;
+      
+      // Ensure output directory exists
+      await fs.mkdir(outputDir, { recursive: true });
+      console.log('✅ Output directory ready:', outputDir);
+      
+      console.log('🔄 Calling ImageProcessor.processImage...');
+      
+      const result = await ImageProcessor.processImage({
+        inputPath: job.data.filePath,
+        outputDir,
+        operations: job.data.operations,
+        filename: this.generateOutputFilename(job.data.originalName, outputFormat),
+        preserveMetadata: false,
+        quality: job.data.operations?.quality,
+      });
+      
+      console.log(`✅ ImageProcessor completed:`, result.outputPath);
+      
+      // Verify output file
+      const outputStats = await fs.stat(result.outputPath);
+      if (outputStats.size === 0) {
+        throw new AppError('Processed file is empty', 500, 'EMPTY_OUTPUT');
+      }
+      console.log('✅ Output file verified. Size:', outputStats.size, 'bytes');
+
+      return result;
+    } catch (error) {
+      console.error('❌ Image processing failed:', error);
+      
+      // Handle specific error types
+      if (error instanceof Error) {
+        const errorMessage = error.message.toLowerCase();
+        
+        if (errorMessage.includes('input file is missing') || 
+            errorMessage.includes('enoent')) {
+          throw new UnrecoverableError('Input file not found');
+        }
+        
+        if (errorMessage.includes('unsupported image format') ||
+            errorMessage.includes('invalid image')) {
+          throw new UnrecoverableError('Unsupported or invalid image format');
+        }
+        
+        if (errorMessage.includes('image too large')) {
+          throw new UnrecoverableError('Image too large to process');
+        }
+      }
+      
+      throw error;
+    }
+  }
+
+  /**
+   * Generate output filename
+   */
+  private generateOutputFilename(originalName: string, format?: string): string {
+    const parsed = path.parse(originalName);
+    const timestamp = Date.now();
+    const outputFormat = format || 'jpeg';
+    return `${parsed.name}_processed_${timestamp}.${outputFormat}`;
+  }
+
+  /**
+   * Schedule file for cleanup - SIMPLE VERSION
+   */
+  private scheduleFileForCleanup(filePath: string, jobId: string, reason: string): void {
+    console.log(`🗑️ Scheduling file for cleanup: ${filePath} (reason: ${reason})`);
+    this.cleanupQueue.add(filePath);
+  }
+
+  /**
+   * Setup simple cleanup worker
+   */
+  private setupSimpleCleanup(): void {
+    console.log('🧹 Setting up simple cleanup worker...');
+    
+    // Run cleanup every 30 seconds
+    this.cleanupInterval = setInterval(async () => {
+      await this.processCleanupQueue();
+    }, 30000);
+  }
+
+  /**
+   * Process cleanup queue - SIMPLIFIED
+   */
+  private async processCleanupQueue(): Promise<void> {
+    if (this.cleanupQueue.size === 0) return;
+
+    console.log(`🧹 Processing cleanup queue (${this.cleanupQueue.size} files)`);
+    
+    const filesToCleanup = Array.from(this.cleanupQueue);
+    this.cleanupQueue.clear(); // Clear queue to prevent duplicates
+
+    for (const filePath of filesToCleanup) {
+      try {
+        // Check if file still exists
+        await fs.access(filePath);
+        
+        // Delete the file
+        await fs.unlink(filePath);
+        console.log(`✅ File cleaned up: ${filePath}`);
+        this.stats.filesCleanedUp++;
+        
+      } catch (error: any) {
+        if (error.code === 'ENOENT') {
+          console.log(`✅ File already deleted: ${filePath}`);
+          this.stats.filesCleanedUp++;
+        } else {
+          console.error(`❌ Failed to cleanup file ${filePath}:`, error);
+          // Re-add to queue for retry
+          this.cleanupQueue.add(filePath);
+        }
+      }
+    }
+  }
+
+  /**
+   * Validate job data
+   */
+  /**
+ * Validate job data
+ */
+private async validateJobData(data: ImageJobPayload): Promise<void> {
+  try {
+    await FileValidationService.validateFile({
+      path: data.filePath,
+      originalName: data.originalName,
+      size: data.fileSize,
+      mimeType: data.mimeType,
+    });
+
+    // Enhanced operations validation
+    if (data.operations) {
+      if (data.operations.resize) {
+        const { width, height } = data.operations.resize;
+        if (width && (width < 1 || width > 10000)) {
+          throw new ValidationError('Invalid resize width');
+        }
+        if (height && (height < 1 || height > 10000)) {
+          throw new ValidationError('Invalid resize height');
+        }
+      }
+      
+      if (data.operations.quality && 
+         (data.operations.quality < 1 || data.operations.quality > 100)) {
+        throw new ValidationError('Quality must be between 1 and 100');
+      }
+
+      // NEW: Add validation for new operations
+      if (data.operations.brightness !== undefined && 
+         (data.operations.brightness < -100 || data.operations.brightness > 100)) {
+        throw new ValidationError('Brightness must be between -100 and 100');
+      }
+
+      if (data.operations.contrast !== undefined && 
+         (data.operations.contrast < -100 || data.operations.contrast > 100)) {
+        throw new ValidationError('Contrast must be between -100 and 100');
+      }
+
+      if (data.operations.saturation !== undefined && 
+         (data.operations.saturation < -100 || data.operations.saturation > 100)) {
+        throw new ValidationError('Saturation must be between -100 and 100');
+      }
+
+      if (data.operations.hue !== undefined && 
+         (data.operations.hue < -360 || data.operations.hue > 360)) {
+        throw new ValidationError('Hue must be between -360 and 360');
+      }
+
+      if (data.operations.gamma !== undefined && 
+         (data.operations.gamma < 0.1 || data.operations.gamma > 3.0)) {
+        throw new ValidationError('Gamma must be between 0.1 and 3.0');
+      }
+
+      if (data.operations.compression !== undefined && 
+         (data.operations.compression < 0 || data.operations.compression > 9)) {
+        throw new ValidationError('Compression must be between 0 and 9');
+      }
+    }
+  } catch (error) {
+    if (error instanceof ValidationError || error instanceof AppError) {
+      throw new UnrecoverableError(error.message);
+    }
+    throw error;
+  }
+}
+  /**
+   * Check if error is recoverable
+   */
+  private isRecoverableError(error: unknown): boolean {
+    if (error instanceof UnrecoverableError || error instanceof ValidationError) {
+      return false;
+    }
+
+    if (error instanceof Error) {
+      const errorMessage = error.message.toLowerCase();
+      
+      // Unrecoverable errors
+      if (errorMessage.includes('input file is missing') ||
+          errorMessage.includes('enoent') ||
+          errorMessage.includes('unsupported image format') ||
+          errorMessage.includes('invalid image') ||
+          errorMessage.includes('image too large')) {
+        return false;
+      }
+      
+      // Recoverable errors
+      if (errorMessage.includes('timeout') ||
+          errorMessage.includes('connection') ||
+          errorMessage.includes('memory')) {
+        return true;
+      }
+    }
+
+    return true; // Default to recoverable
+  }
+
+  /**
+   * Get job status
    */
   public async getJobStatus(jobId: string): Promise<JobStatusResponse | null> {
     try {
       const job = await imageQueue.getJob(jobId);
-      
-      if (!job) {
-        return null;
-      }
+      if (!job) return null;
 
       const jobState = await job.getState();
       const progress = job.progress;
       
       let status: JobStatusResponse['status'] = 'waiting';
       
-      // Map BullMQ states to our API states
       switch (jobState) {
         case 'waiting':
         case 'delayed':
@@ -215,462 +666,9 @@ class ImageWorker extends EventEmitter {
 
       return response;
     } catch (error) {
-      logger.error('Error getting job status:', {
-        jobId,
-        error: error instanceof Error ? error.message : error,
-      });
+      logger.error('Error getting job status:', { jobId, error });
       throw error;
     }
-  }
-
-  /**
-   * Get multiple job statuses - NEW METHOD
-   */
-  public async getJobStatuses(jobIds: string[]): Promise<{ [jobId: string]: JobStatusResponse | null }> {
-    const results: { [jobId: string]: JobStatusResponse | null } = {};
-    
-    await Promise.all(
-      jobIds.map(async (jobId) => {
-        try {
-          results[jobId] = await this.getJobStatus(jobId);
-        } catch (error) {
-          logger.error(`Error getting status for job ${jobId}:`, error);
-          results[jobId] = null;
-        }
-      })
-    );
-
-    return results;
-  }
-
-  /**
-   * Check if processed file exists - NEW METHOD
-   */
-  public async checkProcessedFile(jobId: string): Promise<{ exists: boolean; filePath?: string; fileSize?: number }> {
-    try {
-      const jobStatus = await this.getJobStatus(jobId);
-      
-      if (!jobStatus || jobStatus.status !== 'completed' || !jobStatus.outputPath) {
-        return { exists: false };
-      }
-
-      const filePath = path.resolve(jobStatus.outputPath);
-      
-      try {
-        const stats = await fs.stat(filePath);
-        return {
-          exists: true,
-          filePath,
-          fileSize: stats.size,
-        };
-      } catch (error: any) {
-        if (error.code === 'ENOENT') {
-          return { exists: false };
-        }
-        throw error;
-      }
-    } catch (error) {
-      logger.error('Error checking processed file:', {
-        jobId,
-        error: error instanceof Error ? error.message : error,
-      });
-      return { exists: false };
-    }
-  }
-
-  public async testOperations(operation: any): Promise<any> {
-    console.log('Testing operations:', JSON.stringify(operation, null, 2));
-    const testResult = await ImageProcessor.processImage({
-      inputPath: "C:/Users/Shridhar/OneDrive/Pictures/Screenshots/email.png",
-      outputDir: IMAGE_CONFIG.PROCESSED_DIR,
-      operations: operation,
-      filename: 'test_output.png'
-    });
-    console.log('Direct processor result:', testResult);
-    return testResult;
-  }
-
-  /**
-   * Main job processing function
-   */
-  private async processJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
-    const jobStartTime = performance.now();
-    this.stats.activeJobs++;
-
-    console.log('=== WORKER PROCESSING DEBUG ===');
-    console.log('Job ID:', job.id);
-    console.log('Job data:', JSON.stringify(job.data, null, 2));
-    console.log('Operations received in worker:', JSON.stringify(job.data.operations, null, 2));
-    console.log('Has operations?', !!job.data.operations);
-    console.log('Operations keys:', job.data.operations ? Object.keys(job.data.operations) : 'none');
-    
-    try {
-      logger.info('Processing image job started:', {
-        jobId: job.id,
-        jobType: job.name,
-        filename: job.data.originalName,
-        fileSize: `${Math.round(job.data.fileSize / 1024)}KB`,
-        operations: job.data.operations ? Object.keys(job.data.operations) : [],
-        attempt: job.attemptsMade + 1,
-        maxAttempts: job.opts.attempts,
-        userId: job.data.userId,
-        priority: job.opts.priority,
-        estimatedTime: ImageConfigUtils.estimateProcessingTime(job.data.fileSize, job.data.operations),
-      });
-
-      this.emit('jobStarted', { jobId: job.id, jobData: job.data });
-      await job.updateProgress(10);
-
-      // Validate job data and operations using centralized validation
-      await this.validateJobData(job.data);
-      await job.updateProgress(30);
-
-      // Process based on job type
-      let result: ProcessingResult;
-      
-      switch (job.name) {
-        case ImageJobType.PROCESS_IMAGE:
-          result = await this.processImageJob(job);
-          break;
-        case ImageJobType.BULK_PROCESS:
-          result = await this.processBulkJob(job);
-          break;
-        case ImageJobType.CLEANUP_TEMP:
-          result = await this.processCleanupJob(job);
-          break;
-        default:
-          throw new UnrecoverableError(`Unknown job type: ${job.name}`);
-      }
-
-      await job.updateProgress(90);
-
-      // Clean up input file after successful processing
-      if (job.name !== ImageJobType.CLEANUP_TEMP) {
-        await this.cleanupInputFile(job.data.filePath);
-      }
-      await job.updateProgress(100);
-
-      const processingTime = performance.now() - jobStartTime;
-      result.processingTime = processingTime; // Add processing time to result
-      this.updateStats(processingTime, true);
-
-      logger.info('Image job completed successfully:', {
-        jobId: job.id,
-        jobType: job.name,
-        filename: job.data.originalName,
-        outputPath: result.outputPath,
-        originalSize: `${Math.round(result.originalSize / 1024)}KB`,
-        processedSize: `${Math.round(result.processedSize / 1024)}KB`,
-        compressionRatio: `${Math.round((1 - result.processedSize / result.originalSize) * 100)}%`,
-        processingTime: `${processingTime.toFixed(2)}ms`,
-        operations: result.operations,
-        dimensions: `${result.width}x${result.height}`,
-        userId: job.data.userId,
-      });
-
-      this.emit('jobCompleted', { jobId: job.id, result, processingTime });
-      return result;
-
-    } catch (error) {
-      const processingTime = performance.now() - jobStartTime;
-      this.updateStats(processingTime, false);
-      
-      const isRecoverable = this.isRecoverableError(error);
-      
-      logger.error('Image job processing failed:', {
-        jobId: job.id,
-        jobType: job.name,
-        filename: job.data.originalName,
-        error: error instanceof Error ? error.message : error,
-        errorCode: error instanceof AppError ? error.code : undefined,
-        stack: error instanceof Error ? error.stack : undefined,
-        isRecoverable,
-        attempt: job.attemptsMade + 1,
-        maxAttempts: job.opts.attempts,
-        processingTime: `${processingTime.toFixed(2)}ms`,
-        userId: job.data.userId,
-      });
-
-      this.emit('jobFailed', { 
-        jobId: job.id, 
-        error, 
-        isRecoverable, 
-        attempt: job.attemptsMade + 1,
-        processingTime 
-      });
-
-      // Clean up input file even on failure
-      try {
-        if (job.name !== ImageJobType.CLEANUP_TEMP) {
-          await this.cleanupInputFile(job.data.filePath);
-        }
-      } catch (cleanupError) {
-        logger.warn('Failed to cleanup input file after job failure:', {
-          jobId: job.id,
-          filePath: job.data.filePath,
-          cleanupError,
-        });
-      }
-
-      if (!isRecoverable) {
-        throw new UnrecoverableError(
-          error instanceof Error ? error.message : 'Unrecoverable processing error'
-        );
-      }
-
-      throw error;
-    } finally {
-      this.stats.activeJobs--;
-    }
-  }
-
-  /**
-   * Validate job data using centralized validation service
-   */
-  private async validateJobData(data: ImageJobPayload): Promise<void> {
-    try {
-      // Use centralized validation service
-      await FileValidationService.validateFile({
-        path: data.filePath,
-        originalName: data.originalName,
-        size: data.fileSize,
-        mimeType: data.mimeType,
-      });
-
-      // Check if validateImageOperations method exists
-      if (data.operations) {
-        if ('validateImageOperations' in FileValidationService && 
-            typeof FileValidationService.validateImageOperations === 'function') {
-          await FileValidationService.validateImageOperations(data.operations, {
-            fileSize: data.fileSize,
-            mimeType: data.mimeType,
-            filename: data.originalName,
-          });
-        } else {
-          // Fallback validation if method doesn't exist
-          await this.validateImageOperationsLocal(data.operations, data);
-        }
-      }
-
-    } catch (error) {
-      if (error instanceof ValidationError || error instanceof AppError) {
-        throw new UnrecoverableError(error.message);
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Local fallback validation for image operations
-   */
-  private async validateImageOperationsLocal(operations: ImageOperations, data: ImageJobPayload): Promise<void> {
-    // Basic validation logic
-    if (operations.resize) {
-      if (operations.resize.width && (operations.resize.width < 1 || operations.resize.width > 10000)) {
-        throw new ValidationError('Invalid resize width');
-      }
-      if (operations.resize.height && (operations.resize.height < 1 || operations.resize.height > 10000)) {
-        throw new ValidationError('Invalid resize height');
-      }
-    }
-
-    if (operations.quality && (operations.quality < 1 || operations.quality > 100)) {
-      throw new ValidationError('Quality must be between 1 and 100');
-    }
-
-    if (operations.blur && (operations.blur < 0 || operations.blur > 1000)) {
-      throw new ValidationError('Invalid blur value');
-    }
-
-    if (operations.rotate && (operations.rotate < -360 || operations.rotate > 360)) {
-      throw new ValidationError('Invalid rotation angle');
-    }
-
-    if (operations.sharpen && (operations.sharpen < 0 || operations.sharpen > 100)) {
-      throw new ValidationError('Invalid sharpen value');
-    }
-
-    // Validate format if specified
-    if (operations.format) {
-      const supportedFormats = ['jpeg', 'png', 'webp', 'avif', 'tiff', 'gif'];
-      if (!supportedFormats.includes(operations.format)) {
-        throw new ValidationError(`Unsupported format: ${operations.format}`);
-      }
-    }
-  }
-
-  /**
-   * Process single image job
-   */
-  private async processImageJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
-    logger.debug('Starting single image processing...', {
-      jobId: job.id,
-      inputPath: job.data.filePath,
-      operations: job.data.operations,
-    });
-
-    // Add debug logging to see what operations are being passed
-    console.log('=== WORKER DEBUG ===');
-    console.log('Job data operations:', JSON.stringify(job.data.operations, null, 2));
-    console.log('Operations type:', typeof job.data.operations);
-
-    const outputFormat = job.data.operations?.format || IMAGE_CONFIG.DEFAULTS.OUTPUT_FORMAT;
-    
-    const result = await ImageProcessor.processImage({
-      inputPath: job.data.filePath,
-      outputDir: IMAGE_CONFIG.PROCESSED_DIR,
-      operations: job.data.operations,
-      filename: this.generateOutputFilename(job.data.originalName, outputFormat),
-      preserveMetadata: false,
-      quality: job.data.operations?.quality,
-    });
-
-    return result;
-  }
-
-  /**
-   * Process bulk image job
-   */
-  private async processBulkJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
-    logger.debug('Starting bulk image processing...', {
-      jobId: job.id,
-      inputPath: job.data.filePath,
-    });
-
-    return this.processImageJob(job);
-  }
-
-  /**
-   * Process cleanup job
-   */
-  private async processCleanupJob(job: Job<ImageJobPayload>): Promise<ProcessingResult> {
-    logger.debug('Starting cleanup job...', {
-      jobId: job.id,
-      targetPath: job.data.filePath,
-    });
-
-    try {
-      await fs.unlink(job.data.filePath);
-      
-      return {
-        outputPath: job.data.filePath,
-        originalSize: job.data.fileSize,
-        processedSize: 0,
-        format: 'cleanup',
-        width: 0,
-        height: 0,
-        processingTime: 0,
-        operations: ['cleanup'],
-        metadata: {
-          hasAlpha: false,
-          channels: 0,
-          colorspace: 'unknown',
-        },
-      };
-    } catch (error: any) {
-      if (error.code === 'ENOENT') {
-        logger.debug('Cleanup target file already deleted:', {
-          jobId: job.id,
-          filePath: job.data.filePath,
-        });
-        
-        return {
-          outputPath: job.data.filePath,
-          originalSize: job.data.fileSize,
-          processedSize: 0,
-          format: 'cleanup',
-          width: 0,
-          height: 0,
-          processingTime: 0,
-          operations: ['cleanup:already_deleted'],
-          metadata: {
-            hasAlpha: false,
-            channels: 0,
-            colorspace: 'unknown',
-          },
-        };
-      }
-      
-      throw error;
-    }
-  }
-
-  /**
-   * Clean up input file after processing
-   */
-  private async cleanupInputFile(filePath: string): Promise<void> {
-    try {
-      await fs.unlink(filePath);
-      logger.debug('Input file cleaned up:', { filePath });
-    } catch (error: any) {
-      if (error.code !== 'ENOENT') {
-        logger.warn('Failed to cleanup input file:', {
-          filePath,
-          error: error.message,
-        });
-      }
-    }
-  }
-
-  /**
-   * Generate output filename with proper extension
-   */
-  private generateOutputFilename(originalName: string, format?: string): string {
-    const parsed = path.parse(originalName);
-    const timestamp = Date.now();
-    const outputFormat = format || IMAGE_CONFIG.DEFAULTS.OUTPUT_FORMAT;
-    
-    return `${parsed.name}_processed_${timestamp}.${outputFormat}`;
-  }
-
-  /**
-   * Determine if an error is recoverable using centralized logic
-   */
-  private isRecoverableError(error: unknown): boolean {
-    if (error instanceof UnrecoverableError || error instanceof ValidationError) {
-      return false;
-    }
-
-    if (error instanceof AppError) {
-      const nonRecoverableCodes = [
-        'INVALID_FILE_TYPE',
-        'FILE_TOO_LARGE',
-        'INVALID_OPERATIONS',
-        'MALICIOUS_CONTENT'
-      ];
-      return !nonRecoverableCodes.includes(error.code);
-    }
-
-    if (error instanceof Error) {
-      const recoverableErrorCodes = [
-        'EMFILE',    // Too many open files
-        'ENFILE',    // File table overflow
-        'ENOSPC',    // No space left on device
-        'ECONNRESET', // Connection reset
-        'ETIMEDOUT', // Timeout
-        'ENOTFOUND', // DNS lookup failed
-        'ECONNREFUSED', // Connection refused
-      ];
-
-      const errorCode = (error as any).code;
-      if (recoverableErrorCodes.includes(errorCode)) {
-        return true;
-      }
-
-      const recoverableMessages = [
-        'out of memory',
-        'memory allocation',
-        'insufficient memory',
-        'timeout',
-        'connection',
-        'network',
-      ];
-
-      const errorMessage = error.message.toLowerCase();
-      return recoverableMessages.some(msg => errorMessage.includes(msg));
-    }
-
-    return true;
   }
 
   /**
@@ -693,7 +691,7 @@ class ImageWorker extends EventEmitter {
   }
 
   /**
-   * Setup event handlers for the worker
+   * Setup event handlers
    */
   private setupEventHandlers(): void {
     this.worker.on('ready', () => {
@@ -705,20 +703,14 @@ class ImageWorker extends EventEmitter {
     });
 
     this.worker.on('error', (error) => {
-      logger.error('Worker error:', {
-        error: error.message,
-        stack: error.stack,
-      });
+      logger.error('Worker error:', { error: error.message });
       this.emit('error', error);
     });
 
     this.worker.on('failed', (job, error) => {
       logger.error('Worker job failed:', {
         jobId: job?.id,
-        jobType: job?.name,
         error: error.message,
-        attempts: job?.attemptsMade,
-        maxAttempts: job?.opts.attempts,
       });
     });
 
@@ -729,72 +721,31 @@ class ImageWorker extends EventEmitter {
   }
 
   /**
-   * Setup health check monitoring
+   * Setup health check
    */
   private setupHealthCheck(): void {
-    const startupGracePeriod = 120000; // 2 minutes
-    const healthCheckInterval = 300000; // 5 minutes between checks
-    
-    setTimeout(() => {
-      this.healthCheckInterval = setInterval(async () => {
-        try {
-          const health = await this.getHealthStatus();
-          
-          if (health.status === 'unhealthy') {
-            logger.warn('Worker health degraded (non-critical):', {
-              status: health.status,
-              memoryUsage: health.memoryUsage,
-              queueHealth: health.queueHealth,
-              stats: health.stats
-            });
-            this.emit('healthWarning', health);
-          } else {
-            logger.debug('Worker health check passed:', { status: health.status });
-          }
-          
-          this.emit('healthCheck', health);
-        } catch (error) {
-          logger.debug('Health check error (non-critical):', {
-            error: error instanceof Error ? error.message : String(error)
-          });
-        }
-      }, healthCheckInterval);
-    }, startupGracePeriod);
-  }
-
-  /**
-   * Setup cleanup scheduler for processed files
-   */
-  private setupCleanupScheduler(): void {
-    this.cleanupInterval = setInterval(async () => {
+    this.healthCheckInterval = setInterval(async () => {
       try {
-        const deletedCount = await ImageProcessor.cleanupOldFiles(IMAGE_CONFIG.CLEANUP.MAX_AGE_HOURS);
-        if (deletedCount > 0) {
-          logger.info('Scheduled cleanup completed:', { deletedFiles: deletedCount });
-        }
+        const health = await this.getHealthStatus();
+        this.emit('healthCheck', health);
       } catch (error) {
-        logger.error('Scheduled cleanup error:', error);
+        logger.debug('Health check error:', { error });
       }
-    }, IMAGE_CONFIG.CLEANUP.CLEANUP_INTERVAL);
+    }, 300000); // 5 minutes
   }
 
   /**
-   * Get worker health status
+   * Get health status
    */
   async getHealthStatus(): Promise<HealthStatus> {
     const uptime = Date.now() - this.stats.startTime;
     const memoryUsage = process.memoryUsage();
-    
-    const CRITICAL_MEMORY_RATIO = 0.99;
-    const HIGH_MEMORY_RATIO = 0.95;
-    const MAX_WAITING = 1000;
     
     let queueHealth = {
       waiting: 0,
       active: 0,
       completed: 0,
       failed: 0,
-      stalled: 0,
     };
 
     try {
@@ -804,53 +755,18 @@ class ImageWorker extends EventEmitter {
         active: jobCounts.active || 0,
         completed: jobCounts.completed || 0,
         failed: jobCounts.failed || 0,
-        stalled: jobCounts.stalled || 0,
       };
-    } catch (queueError) {
-      // Silently continue with defaults
+    } catch (error) {
+      // Continue with defaults
     }
 
-    try {
-      let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy';
-      
-      const totalProcessed = this.stats.processed + this.stats.failed;
-      const failureRate = totalProcessed > 0 ? this.stats.failed / totalProcessed : 0;
-      const memoryUsageMB = memoryUsage.rss / (1024 * 1024);
-      const heapRatio = memoryUsage.heapUsed / memoryUsage.heapTotal;
-
-      if (heapRatio > CRITICAL_MEMORY_RATIO && memoryUsageMB > 2048) {
-        status = 'unhealthy';
-      } else if (queueHealth.waiting > MAX_WAITING) {
-        status = 'unhealthy';
-      } else if (failureRate > 0.95 && totalProcessed > 10) {
-        status = 'unhealthy';
-      } else if (heapRatio > HIGH_MEMORY_RATIO) {
-        status = 'degraded';
-      } else if (queueHealth.waiting > MAX_WAITING / 2) {
-        status = 'degraded';
-      } else if (failureRate > 0.8 && totalProcessed > 5) {
-        status = 'degraded';
-      }
-
-      const healthStatus = {
-        status,
-        uptime,
-        stats: { ...this.stats },
-        memoryUsage,
-        queueHealth,
-      };
-
-      return healthStatus;
-
-    } catch (statusError) {
-      return {
-        status: 'healthy',
-        uptime,
-        stats: { ...this.stats },
-        memoryUsage,
-        queueHealth,
-      };
-    }
+    return {
+      status: 'healthy',
+      uptime,
+      stats: { ...this.stats },
+      memoryUsage,
+      queueHealth,
+    };
   }
 
   /**
@@ -861,81 +777,54 @@ class ImageWorker extends EventEmitter {
       throw new Error('Cannot start worker during shutdown');
     }
 
-    try {
-      await this.worker.run();
-      logger.info('Image worker started successfully');
-    } catch (error) {
-      logger.error('Failed to start image worker:', error);
-      throw error;
-    }
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Worker ready timeout'));
+      }, 10000);
+
+      if (this.worker.isRunning()) {
+        clearTimeout(timeout);
+        logger.info('Image worker is already running');
+        resolve();
+        return;
+      }
+
+      this.worker.once('ready', () => {
+        clearTimeout(timeout);
+        logger.info('Image worker started successfully');
+        resolve();
+      });
+
+      this.worker.once('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+    });
   }
 
   /**
-   * Stop the worker gracefully
+   * Stop the worker
    */
   async stop(): Promise<void> {
-    await this.gracefulShutdown();
-  }
-
-  /**
-   * Graceful shutdown process
-   */
-  private async gracefulShutdown(): Promise<void> {
-    if (this.isShuttingDown) {
-      return;
-    }
-
     this.isShuttingDown = true;
-    logger.info('Starting graceful shutdown of image worker...');
-
-    try {
-      if (this.healthCheckInterval) {
-        clearInterval(this.healthCheckInterval);
-      }
-      
-      if (this.cleanupInterval) {
-        clearInterval(this.cleanupInterval);
-      }
-
-      await this.worker.close();
-      
-      logger.info('Image worker shutdown completed successfully');
-      this.emit('shutdown');
-      
-    } catch (error) {
-      logger.error('Error during worker shutdown:', error);
-      this.emit('shutdownError', error);
-      throw error;
+    
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
     }
-  }
+    
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
 
-  async close(): Promise<void> {
-    return this.gracefulShutdown();
+    await this.worker.close();
+    this.emit('shutdown');
   }
 
   getStats(): WorkerStats {
     return { ...this.stats };
-  }
-
-  resetStats(): void {
-    this.stats = {
-      processed: 0,
-      failed: 0,
-      startTime: Date.now(),
-      totalProcessingTime: 0,
-      averageProcessingTime: 0,
-      activeJobs: 0,
-    };
   }
 }
 
 export const imageWorker = new ImageWorker();
 export type { ImageOperations, JobStatusResponse };
 export { ImageWorker };
-
-if (require.main === module) {
-  imageWorker.start().catch((error) => {
-    logger.error('Failed to start image worker:', error);
-    process.exit(1);
-  });
-}

@@ -1,5 +1,5 @@
 // src/config/image.config.ts
-import { PROCESSING_QUEUE_NAME } from './env';
+import { PROCESSING_QUEUE_NAME, UPLOAD_DIR } from './env';
 
 // Validate PROCESSED_DIR to ensure it's a string
 const PROCESSED_DIR = process.env.PROCESSED_DIR || './processed_images';
@@ -8,6 +8,7 @@ if (!PROCESSED_DIR) {
 }
 
 export const IMAGE_CONFIG = {
+  UPLOAD_DIR,
   PROCESSED_DIR, // Guaranteed string
   FILE_LIMITS: {
     MAX_SIZE: 50 * 1024 * 1024, // 50MB

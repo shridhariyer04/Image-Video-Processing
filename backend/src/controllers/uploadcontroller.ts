@@ -1,14 +1,24 @@
-import {Request, Response, NextFunction} from "express";
+import { Request, Response, NextFunction, Router } from "express";
 import path from "path";
-import fs from 'fs/promises';
-import {ZodError, z} from 'zod';
-import {imageQueue, ImageJobPayload, ImageJobType, JobPriority, ImageOperations} from "../config/bullmq";
-import logger from '../utils/logger';
+import fs from "fs/promises";
+import multer from "multer";
+import { v4 as uuidv4 } from "uuid";
+import { ZodError, z } from "zod";
+import {
+  imageQueue,
+  ImageJobPayload,
+  ImageJobType,
+  JobPriority,
+  ImageOperations,
+} from "../config/bullmq";
+import logger from "../utils/logger";
 import { AppError } from "../utils/error";
 import { FileValidationService } from "../service/validationservice";
 import { ImageConfigUtils, IMAGE_CONFIG } from "../config/image.config";
 
-// Define Multer file interface
+/* ------------------- Multer Setup ------------------- */
+const upload = multer({ dest: "uploads/" });
+
 interface MulterFile {
   fieldname: string;
   originalname: string;
@@ -19,242 +29,330 @@ interface MulterFile {
   path: string;
   size: number;
 }
-
-// Extend Express Request to include Multer file - Fixed interface
-interface MulterRequest extends Omit<Request, 'file'> {
+interface MulterRequest extends Omit<Request, "file"> {
   file?: MulterFile;
 }
 
-// Remove local interfaces - use the ones from bullmq instead
-// Import ImageOperations from bullmq config to ensure type consistency
+/* ------------------- Zod Schema ------------------- */
+const operationsSchema = z
+  .object({
+    crop: z
+      .object({
+        x: z.number().min(0),
+        y: z.number().min(0).max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT),
+        width: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH),
+        height: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT),
+      })
+      .optional(),
 
-// operation validation schema using centralized config
-const operationsSchema = z.object({
-  crop: z.object({
-    x: z.number().min(0),
-    y: z.number().min(0).max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT), // Fixed: should be min(0) not positive()
-    width: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH),
-    height: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT),
-  }).optional(),
+    resize: z
+      .object({
+        width: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH).optional(),
+        height: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT).optional(),
+        fit: z.enum(["cover", "contain", "fill", "inside", "outside"]).default("cover"),
+        position: z.enum(["centre", "top", "right", "left", "bottom"]).default("centre"),
+      })
+      .refine((data) => data.width || data.height, {
+        message: "At least width or height must be specified for resize operation",
+      })
+      .optional(),
 
-  resize: z.object({
-    width: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH).optional(),
-    height: z.number().positive().max(IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT).optional(),
-    fit: z.enum(['cover', 'contain', 'fill', 'inside', 'outside']).default('cover'),
-    // Fix: Use 'centre' to match bullmq config, or update bullmq to use 'center'
-    position: z.enum(['centre', 'top', 'right', 'left', 'bottom']).default('centre')
-  }).refine(data => data.width || data.height, {
-    message: "At least width or height must be specified for resize operation"
-  }).optional(),
+    rotate: z.number().min(-360).max(360).optional(),
+    quality: z.number().min(1).max(100).optional(),
+    blur: z.number().min(0.3).max(1000).optional(),
+    sharpen: z.number().optional(),
+    grayscale: z.boolean().optional(),
+    format: z.enum(['jpeg', 'png', 'webp', 'avif', 'tiff', 'gif']).optional(),
+    
+    // NEW: Add these missing operations
+    flip: z.boolean().optional(),
+    flop: z.boolean().optional(),
+    brightness: z.number().min(-100).max(100).optional(),
+    contrast: z.number().min(-100).max(100).optional(),
+    saturation: z.number().min(-100).max(100).optional(),
+    hue: z.number().min(-360).max(360).optional(),
+    gamma: z.number().min(0.1).max(3.0).optional(),
+    sepia: z.boolean().optional(),
+    negate: z.boolean().optional(),
+    normalize: z.boolean().optional(),
+    progressive: z.boolean().optional(),
+    lossless: z.boolean().optional(),
+    compression: z.number().min(0).max(9).optional(),
+    
+    watermark: z.discriminatedUnion("type", [
+      z.object({
+        type: z.literal("text"),
+        text: z.string().min(1).max(100),
+        fontSize: z.number().min(8).max(200).optional(),
+        fontFamily: z.string().optional(),
+        color: z.string().regex(/^#[0-9A-Fa-f]{6}$/).optional(),
+        opacity: z.number().min(0.1).max(1).optional(),
+        gravity: z.enum(["north", "south", "east", "west", "center", "top-left", "top-right", "bottom-left", "bottom-right"]).optional(),
+        dx: z.number().optional(),
+        dy: z.number().optional(),
+      }),
+      z.object({
+        type: z.literal("image"),
+        imagePath: z.string().min(1),
+        width: z.number().positive().optional(),
+        height: z.number().positive().optional(),
+        opacity: z.number().min(0.1).max(1).optional(),
+        gravity: z.enum(["north", "south", "east", "west", "center", "top-left", "top-right", "bottom-left", "bottom-right"]).optional(),
+        dx: z.number().optional(),
+        dy: z.number().optional(),
+      })
+    ]).optional(),
+  })
+  .optional();
 
-  rotate: z.number()
-    .min(IMAGE_CONFIG.PROCESSING_LIMITS.MIN_ROTATION)
-    .max(IMAGE_CONFIG.PROCESSING_LIMITS.MAX_ROTATION)
-    .optional(),
-  
-  // Fix: Use specific enum values instead of generic z.enum()
-  // format: z.enum(IMAGE_CONFIG.FORMATS.OUTPUT_FORMATS as [string, ...string[]]).optional(),
-  
-  quality: z.number()
-    .min(IMAGE_CONFIG.PROCESSING_LIMITS.MIN_QUALITY)
-    .max(IMAGE_CONFIG.PROCESSING_LIMITS.MAX_QUALITY)
-    .optional(),
-  
-  blur: z.number()
-    .min(IMAGE_CONFIG.PROCESSING_LIMITS.MIN_BLUR)
-    .max(IMAGE_CONFIG.PROCESSING_LIMITS.MAX_BLUR)
-    .optional(),
-  
-  sharpen: z.number().optional(),
-  grayscale: z.boolean().optional(),
-}).optional();
-
-export async function handleUpload(req: MulterRequest, res: Response, next: NextFunction): Promise<void> {
+/* ------------------- Core Upload Handler ------------------- */
+export async function handleUpload(
+  req: MulterRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
   const startTime = Date.now();
-  const requestId = req.headers['x-request-id'] || `req-${Date.now()}`;
+  const requestId = req.headers["x-request-id"] || `req-${Date.now()}`;
+  let uploadedFilePath: string | undefined;
 
   try {
     const file = req.file;
-
     if (!file) {
-      throw new AppError('No file uploaded', 400, 'MISSING_FILE');
+      throw new AppError("No file uploaded", 400, "MISSING_FILE");
     }
 
+    uploadedFilePath = file.path;
+
+    console.log('=== FILE UPLOAD START ===');
+    console.log('Original name:', file.originalname);
+    console.log('File path:', file.path);
+    console.log('File size:', file.size);
+    console.log('MIME type:', file.mimetype);
+    console.log('==========================');
+
+    // Validate file
     await FileValidationService.validateFile({
       path: file.path,
       originalName: file.originalname,
       size: file.size,
-      mimeType: file.mimetype
+      mimeType: file.mimetype,
     });
 
-    let operations: ImageOperations | undefined;
+    console.log('✅ File validation passed');
 
+    // Parse operations
+    let operations: ImageOperations | undefined;
     if (req.body.operations) {
       try {
-        const rawOperations = typeof req.body.operations === 'string' ? 
-          JSON.parse(req.body.operations) : req.body.operations;
+        const rawOps = typeof req.body.operations === "string" 
+          ? JSON.parse(req.body.operations) 
+          : req.body.operations;
+        
+        console.log('Raw operations:', rawOps);
+        
+        const parsedOps = operationsSchema.parse(rawOps);
+        operations = parsedOps as ImageOperations;
 
-        // Parse with Zod and then cast to ImageOperations
-        const parsedOperations = operationsSchema.parse(rawOperations);
-        operations = parsedOperations as ImageOperations;
+        console.log('✅ Operations parsed:', operations);
 
-        // Additional validation for operations
         await validateImageOperations(operations, {
           fileSize: file.size,
           mimeType: file.mimetype,
           fileName: file.originalname,
         });
 
-      } catch (error) {
+        console.log('✅ Operations validation passed');
+      } catch (err) {
+        console.error('❌ Operations parsing/validation failed:', err);
         await cleanUploadedFile(file.path);
-
-        if (error instanceof ZodError) {
-          const validationErrors = error.issues.map(err => ({
-            field: err.path.join('.'),
-            message: err.message,
-          }));
-
-          logger.warn('Invalid operations provided', {
-            requestId,
-            validationErrors,
-            filename: file.originalname
-          });
-
-          throw new AppError('Invalid image operations', 400, 'INVALID_OPERATIONS', {
-            validationErrors,
+        
+        if (err instanceof ZodError) {
+          throw new AppError("Invalid image operations", 400, "INVALID_OPERATIONS", {
+            validationErrors: err.issues.map((i) => ({
+              field: i.path.join("."),
+              message: i.message,
+            })),
           });
         }
-        
-        logger.warn('Operations parsing failed', { requestId, error });
-        throw new AppError('Invalid operations format', 400, 'OPERATIONS_PARSE_ERROR');
+        throw new AppError("Invalid operations format", 400, "OPERATIONS_PARSE_ERROR");
       }
     }
 
+    // Build job payload
     const payload: ImageJobPayload = {
       filePath: path.resolve(file.path),
       originalName: file.originalname,
       fileSize: file.size,
       mimeType: file.mimetype,
       uploadedAt: new Date(),
-      operations, // This should now work without type errors
+      operations,
     };
 
-    // Determine job priority using centralized logic
+    console.log('✅ Job payload created:', {
+      filePath: payload.filePath,
+      originalName: payload.originalName,
+      fileSize: payload.fileSize,
+      operations: operations ? Object.keys(operations) : [],
+    });
+
+    // Job priority
     const priority = ImageConfigUtils.determineJobPriority(
       file.size,
       operations ? Object.keys(operations).length : 0
     );
 
-    const job = await imageQueue.add(
-      ImageJobType.PROCESS_IMAGE,
-      payload,
-      {
-        priority: priority === 'high' ? JobPriority.HIGH :
-          priority === 'low' ? JobPriority.LOW : JobPriority.NORMAL,
-        attempts: 3,
-        backoff: {
-          type: 'exponential',
-          delay: IMAGE_CONFIG.WORKER.TIMEOUTS.RETRY_DELAY,
-        },
-        removeOnComplete: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_COMPLETED_JOBS,
-        removeOnFail: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_FAILED_JOBS,
-        delay: 0,
-        jobId: `img-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        timestamp: Date.now(),
-      }
-    );
+    console.log('Job priority determined:', priority);
 
-    logger.info('Image processing job enqueued successfully', {
+    // Create job - NO REFERENCE COUNTING
+    const jobId = `img-${Date.now()}-${uuidv4()}`;
+    
+    const job = await imageQueue.add(ImageJobType.PROCESS_IMAGE, payload, {
+      jobId,
+      priority:
+        priority === "high"
+          ? JobPriority.HIGH
+          : priority === "low"
+          ? JobPriority.LOW
+          : JobPriority.NORMAL,
+      attempts: 3,
+      backoff: { 
+        type: "exponential", 
+        delay: IMAGE_CONFIG.WORKER.TIMEOUTS.RETRY_DELAY 
+      },
+      removeOnComplete: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_COMPLETED_JOBS,
+      removeOnFail: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_FAILED_JOBS,
+    });
+
+    console.log('✅ Job created successfully:', job.id);
+
+    logger.info("Image processing job enqueued", {
       jobId: job.id,
       requestId,
       filename: file.originalname,
       fileSize: file.size,
-      mimeType: file.mimetype,
       operations: operations ? Object.keys(operations) : [],
       priority,
-      processingTime: Date.now() - startTime,
+      time: Date.now() - startTime,
     });
+
+    console.log('=== UPLOAD COMPLETED ===');
+    console.log('Job ID:', job.id);
+    console.log('File will be processed and cleaned up automatically');
+    console.log('========================');
 
     res.status(202).json({
       success: true,
-      message: 'File uploaded and queued for processing',
+      message: "File uploaded and queued for processing",
       data: {
         jobId: job.id,
         fileName: file.originalname,
-        fileSize: file.size,
-        mimeType: file.mimetype,
-        estimatedProcessingTime: ImageConfigUtils.estimateProcessingTime(file.size, operations),
+        estimatedProcessingTime: ImageConfigUtils.estimateProcessingTime(
+          file.size,
+          operations
+        ),
         queuePosition: await getQueuePosition(job.id as string),
         priority,
       },
-      timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    if (req.file?.path) {
-      await cleanUploadedFile(req.file.path);
+    console.error('❌ Upload failed:', error);
+    
+    // Cleanup uploaded file on error
+    if (uploadedFilePath) {
+      await cleanUploadedFile(uploadedFilePath);
+      console.log('🧹 Cleaned up uploaded file due to error');
     }
-
-    logger.error('Upload handle error', {
-      error: error instanceof Error ? error.message : error,
-      stack: error instanceof Error ? error.stack : undefined,
-      requestId,
-      fileName: req.file?.originalname,
-      processingTime: Date.now() - startTime,
-    });
-
+    
     next(error);
   }
 }
 
+/* ------------------- Validation Helper ------------------- */
 async function validateImageOperations(
   operations: ImageOperations | undefined,
   fileInfo: { fileSize: number; mimeType: string; fileName: string }
 ): Promise<void> {
   if (!operations) return;
-
-  const operationsCount = Object.keys(operations).length;
   
-  // Check maximum operations limit
-  if (operationsCount > IMAGE_CONFIG.PROCESSING_LIMITS.MAX_OPERATIONS) {
-    throw new AppError(
-      `Too many operations (max ${IMAGE_CONFIG.PROCESSING_LIMITS.MAX_OPERATIONS})`,
-      400,
-      'TOO_MANY_OPERATIONS'
-    );
+  if (Object.keys(operations).length > IMAGE_CONFIG.PROCESSING_LIMITS.MAX_OPERATIONS) {
+    throw new AppError("Too many operations", 400, "TOO_MANY_OPERATIONS");
   }
-
-  // Validate format conversion support - Remove this section if method doesn't exist
+  
   if (operations.format) {
-    // Fix: Type assertion to ensure TypeScript knows it's one of the valid formats
-    const format = operations.format as typeof IMAGE_CONFIG.FORMATS.OUTPUT_FORMATS[number];
-    
-    // Alternative: Basic format validation with proper typing
-    const supportedFormats = IMAGE_CONFIG.FORMATS.OUTPUT_FORMATS as readonly string[];
-    if (!supportedFormats.includes(format)) {
-      throw new AppError(
-        `Format ${format} is not supported`,
-        400,
-        'UNSUPPORTED_FORMAT'
-      );
+    const supported = IMAGE_CONFIG.FORMATS.OUTPUT_FORMATS as readonly string[];
+    if (!supported.includes(operations.format)) {
+      throw new AppError("Unsupported format", 400, "UNSUPPORTED_FORMAT");
     }
   }
-
-  // Validate crop dimensions don't exceed file constraints
+  
+  // Existing validation...
+  if (operations.resize) {
+    const { width, height } = operations.resize;
+    if (width && width > IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH) {
+      throw new AppError("Resize width too large", 400, "INVALID_RESIZE_WIDTH");
+    }
+    if (height && height > IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT) {
+      throw new AppError("Resize height too large", 400, "INVALID_RESIZE_HEIGHT");
+    }
+  }
+  
   if (operations.crop) {
-    const { crop } = operations;
-    if (crop.width > IMAGE_CONFIG.DIMENSION_LIMITS.MAX_WIDTH || 
-        crop.height > IMAGE_CONFIG.DIMENSION_LIMITS.MAX_HEIGHT) {
-      throw new AppError(
-        `Crop dimensions exceed maximum limits`,
-        400,
-        'CROP_DIMENSIONS_EXCEEDED'
-      );
+    const { x, y, width, height } = operations.crop;
+    if (x < 0 || y < 0 || width <= 0 || height <= 0) {
+      throw new AppError("Invalid crop coordinates", 400, "INVALID_CROP");
     }
   }
 
-  // Large file operation warnings
+  // NEW: Add validation for new operations
+  if (operations.brightness !== undefined) {
+    if (operations.brightness < -100 || operations.brightness > 100) {
+      throw new AppError("Brightness must be between -100 and 100", 400, "INVALID_BRIGHTNESS");
+    }
+  }
+
+  if (operations.contrast !== undefined) {
+    if (operations.contrast < -100 || operations.contrast > 100) {
+      throw new AppError("Contrast must be between -100 and 100", 400, "INVALID_CONTRAST");
+    }
+  }
+
+  if (operations.saturation !== undefined) {
+    if (operations.saturation < -100 || operations.saturation > 100) {
+      throw new AppError("Saturation must be between -100 and 100", 400, "INVALID_SATURATION");
+    }
+  }
+
+  if (operations.hue !== undefined) {
+    if (operations.hue < -360 || operations.hue > 360) {
+      throw new AppError("Hue must be between -360 and 360", 400, "INVALID_HUE");
+    }
+  }
+
+  if (operations.gamma !== undefined) {
+    if (operations.gamma < 0.1 || operations.gamma > 3.0) {
+      throw new AppError("Gamma must be between 0.1 and 3.0", 400, "INVALID_GAMMA");
+    }
+  }
+
+  if (operations.compression !== undefined) {
+    if (operations.compression < 0 || operations.compression > 9) {
+      throw new AppError("Compression must be between 0 and 9", 400, "INVALID_COMPRESSION");
+    }
+  }
+
+  // Watermark validation
+  if (operations.watermark) {
+    if (operations.watermark.type === "text" && (!operations.watermark.text || operations.watermark.text.trim().length === 0)) {
+      throw new AppError("Watermark text cannot be empty", 400, "INVALID_WATERMARK_TEXT");
+    }
+    
+    if (operations.watermark.type === "image" && !operations.watermark.imagePath) {
+      throw new AppError("Watermark image path is required", 400, "INVALID_WATERMARK_IMAGE");
+    }
+  }
+  
   if (fileInfo.fileSize > IMAGE_CONFIG.PERFORMANCE.LARGE_FILE_THRESHOLD) {
-    logger.info('Large file processing requested', {
+    logger.info("Large file operation", {
       fileName: fileInfo.fileName,
       fileSize: fileInfo.fileSize,
       operations: Object.keys(operations),
@@ -262,28 +360,140 @@ async function validateImageOperations(
   }
 }
 
-/* Queue position */
+/* ------------------- Helper Functions ------------------- */
 async function getQueuePosition(jobId: string): Promise<number> {
   try {
     const waitingJobs = await imageQueue.getWaiting();
-    const position = waitingJobs.findIndex(job => job.id === jobId);
-
-    return position === -1 ? 0 : position + 1;
-  } catch (error) {
-    logger.warn('Failed to get queue position:', { jobId, error });
+    const pos = waitingJobs.findIndex((j) => j.id === jobId);
+    return pos === -1 ? 0 : pos + 1;
+  } catch {
     return 0;
   }
 }
 
-/* Cleanup uploaded file */
 async function cleanUploadedFile(filePath: string): Promise<void> {
   try {
     await fs.unlink(filePath);
-    logger.debug('Cleaned up uploaded file', { filePath });
-  } catch (cleanupError) {
-    logger.warn('Failed to cleanup uploaded file', {
-      filePath,
-      error: cleanupError
-    });
+    console.log('🧹 Uploaded file cleaned up:', filePath);
+  } catch (error) {
+    console.warn('⚠️ Failed to cleanup uploaded file:', filePath, error);
   }
 }
+
+/* ------------------- Router ------------------- */
+export const imageRouter = Router();
+
+// Main upload endpoint
+imageRouter.post("/upload", upload.single("image"), handleUpload);
+
+// Health check endpoint
+imageRouter.get("/health", async (req, res) => {
+  try {
+    const queueCounts = await imageQueue.getJobCounts('waiting', 'active', 'completed', 'failed');
+    
+    res.json({
+      success: true,
+      status: 'healthy',
+      queue: queueCounts,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      status: 'unhealthy',
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// Job status endpoint
+imageRouter.get("/job/:jobId", async (req, res) => {
+  try {
+    const { jobId } = req.params;
+    const job = await imageQueue.getJob(jobId);
+    
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        message: "Job not found",
+      });
+    }
+    
+    const jobState = await job.getState();
+    const progress = job.progress;
+    
+    let status = 'waiting';
+    switch (jobState) {
+      case 'waiting':
+      case 'delayed':
+      case 'paused':
+        status = jobState;
+        break;
+      case 'active':
+        status = 'active';
+        break;
+      case 'completed':
+        status = 'completed';
+        break;
+      case 'failed':
+        status = 'failed';
+        break;
+    }
+    
+    const response: any = {
+      success: true,
+      data: {
+        jobId,
+        status,
+        progress,
+        createdAt: job.timestamp ? new Date(job.timestamp) : null,
+        processedAt: job.processedOn ? new Date(job.processedOn) : null,
+        data: job.data,
+      }
+    };
+    
+    // Add result for completed jobs
+    if (status === 'completed' && job.returnvalue) {
+      response.data.result = job.returnvalue;
+      response.data.outputPath = job.returnvalue.outputPath;
+    }
+    
+    // Add error for failed jobs
+    if (status === 'failed' && job.failedReason) {
+      response.data.error = job.failedReason;
+    }
+    
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to get job status",
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+// Queue management endpoints
+imageRouter.post("/queue/clean", async (req, res) => {
+  try {
+    const completed = await imageQueue.clean(24 * 60 * 60 * 1000, 100, 'completed');
+    const failed = await imageQueue.clean(7 * 24 * 60 * 60 * 1000, 50, 'failed');
+    
+    res.json({
+      success: true,
+      message: "Queue cleaned successfully",
+      data: {
+        completedCleaned: completed,
+        failedCleaned: failed,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Failed to clean queue",
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+export default imageRouter;

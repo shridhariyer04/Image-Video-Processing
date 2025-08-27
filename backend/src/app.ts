@@ -1,13 +1,13 @@
 // src/app.ts
 import express, { Application, Request, Response, NextFunction } from 'express';
-import uploadRouter from './routes/upload.route'; // Import your fixed router
+import uploadRouter from './routes/upload.route';
 import { AppError } from './utils/error';
 import logger from './utils/logger';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 
-const app: Application = express();
+const app:Application  = express();
 
 // Middleware setup
 app.use(helmet()); // Security headers
@@ -43,11 +43,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-// Mount the upload router at /upload
-// Routes: / becomes /upload, /job/:jobId/status becomes /upload/job/:jobId/status, etc.
-app.use('/upload', uploadRouter);
-
-// Health check endpoint
+// Health check endpoint - Define before mounting routers
 app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
@@ -79,7 +75,7 @@ app.get('/api', (_req: Request, res: Response) => {
       },
       jobStatus: {
         method: 'GET',
-        path: '/upload/job/:jobId/status', // Updated to reflect correct mounting
+        path: '/upload/job/:jobId/status',
         description: 'Get job processing status',
         parameters: {
           jobId: 'String (required) - Job ID returned from upload'
@@ -87,7 +83,7 @@ app.get('/api', (_req: Request, res: Response) => {
       },
       jobDownload: {
         method: 'GET',
-        path: '/upload/job/:jobId/download', // Updated to reflect correct mounting
+        path: '/upload/job/:jobId/download',
         description: 'Download processed image',
         parameters: {
           jobId: 'String (required) - Job ID of completed job'
@@ -95,7 +91,7 @@ app.get('/api', (_req: Request, res: Response) => {
       },
       bulkJobStatus: {
         method: 'GET',
-        path: '/upload/jobs/status?jobIds=id1,id2,id3', // Updated to reflect correct mounting
+        path: '/upload/jobs/status?jobIds=id1,id2,id3',
         description: 'Get status of multiple jobs',
         parameters: {
           jobIds: 'String (required) - Comma-separated job IDs'
@@ -103,7 +99,7 @@ app.get('/api', (_req: Request, res: Response) => {
       },
       workerStats: {
         method: 'GET',
-        path: '/upload/worker/stats', // Updated to reflect correct mounting
+        path: '/upload/worker/stats',
         description: 'Get worker statistics and health'
       },
       health: {
@@ -116,33 +112,8 @@ app.get('/api', (_req: Request, res: Response) => {
   });
 });
 
-// Catch-all for undefined routes (404 handler) - FIXED: Named wildcard parameter
-app.use('*catchall', (req: Request, res: Response) => {
-  logger.warn('Route not found:', {
-    method: req.method,
-    url: req.originalUrl,
-    ip: req.ip,
-    userAgent: req.get('User-Agent')
-  });
-
-  res.status(404).json({
-    success: false,
-    error: {
-      code: 'NOT_FOUND',
-      message: `Route ${req.method} ${req.originalUrl} not found`,
-      availableEndpoints: [
-        'POST /upload',
-        'GET /upload/job/:jobId/status',
-        'GET /upload/job/:jobId/download',
-        'GET /upload/jobs/status',
-        'GET /upload/worker/stats',
-        'GET /health',
-        'GET /api'
-      ]
-    },
-    timestamp: new Date().toISOString(),
-  });
-});
+// Mount the upload router at /upload
+app.use('/upload', uploadRouter);
 
 // Global error handler
 app.use((error: Error | AppError, req: Request, res: Response, _next: NextFunction) => {
@@ -180,4 +151,33 @@ app.use((error: Error | AppError, req: Request, res: Response, _next: NextFuncti
   });
 });
 
+// 404 handler - Must be last, after all routes and error handlers
+app.use((req: Request, res: Response) => {
+  logger.warn('Route not found:', {
+    method: req.method,
+    url: req.originalUrl,
+    ip: req.ip,
+    userAgent: req.get('User-Agent')
+  });
+
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'NOT_FOUND',
+      message: `Route ${req.method} ${req.originalUrl} not found`,
+      availableEndpoints: [
+        'POST /upload',
+        'GET /upload/job/:jobId/status',
+        'GET /upload/job/:jobId/download',
+        'GET /upload/jobs/status',
+        'GET /upload/worker/stats',
+        'GET /health',
+        'GET /api'
+      ]
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Export the Express application
 export default app;
