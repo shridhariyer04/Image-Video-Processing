@@ -13,7 +13,8 @@
     "rootDir": "./src",
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmitOnError": false
+    "noEmitOnError": false,
+     "noImplicitAny": false
   },
   "include": ["src/**/*","testworker"],
   "exclude": ["node_modules", "dist"]
