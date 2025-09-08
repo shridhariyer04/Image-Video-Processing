@@ -36,11 +36,7 @@ imageQueueEvents.on('active', ({ jobId }) => {
 });
 
 imageQueueEvents.on('completed', ({ jobId, returnvalue }) => {
-  logger.info('Job completed:', { 
-    // jobId, 
-    // outputPath: returnvalue?.outputPath,
-    // processingTime: returnvalue?.processingTime 
-  });
+  logger.info('Job completed:', { jobId});
 });
 
 imageQueueEvents.on('failed', async ({ jobId, failedReason }) => {

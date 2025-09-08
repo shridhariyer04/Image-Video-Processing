@@ -11,7 +11,7 @@ import { generateRecommendations } from '../utils/Helper';
 const router = express.Router();
 
 // POST / (will become /upload when mounted)
-router.post('/', upload.single('image'), handleMulterError, handleUpload);
+router.post('/', upload.array('image',5), handleMulterError, handleUpload);
 
 // GET /job/:jobId/status (will become /upload/job/:jobId/status when mounted)
 router.get('/job/:jobId/status', async (req: Request, res: Response, next: NextFunction) => {

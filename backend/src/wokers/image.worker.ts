@@ -44,11 +44,14 @@ interface ImageOperations {
   progressive?: boolean;
   lossless?: boolean;
   compression?: number;
-  watermark?: {
+   watermark?: {
+    type: 'text' | 'image';
     text?: string;
-    image?: string;
-    position?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'center';
-    opacity?: number;
+    imagePath?: string;
+    opacity: number;
+    gravity: string;
+    fontSize?: number;  // Add this
+    color?: string;     // Add this
   };
 }
 

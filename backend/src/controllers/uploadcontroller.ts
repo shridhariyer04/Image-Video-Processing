@@ -29,8 +29,9 @@ interface MulterFile {
   path: string;
   size: number;
 }
-interface MulterRequest extends Omit<Request, "file"> {
+interface MulterRequest extends Omit<Request, "file"|"files"> {
   file?: MulterFile;
+  files?:MulterFile[];
 }
 
 /* ------------------- Zod Schema ------------------- */
@@ -107,143 +108,151 @@ const operationsSchema = z
 
 /* ------------------- Core Upload Handler ------------------- */
 export async function handleUpload(
-  req: MulterRequest,
+  req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
   const startTime = Date.now();
   const requestId = req.headers["x-request-id"] || `req-${Date.now()}`;
-  let uploadedFilePath: string | undefined;
+  const uploadedFilePaths: string[] = [];
 
   try {
-    const file = req.file;
-    if (!file) {
-      throw new AppError("No file uploaded", 400, "MISSING_FILE");
+    const files = req.files as MulterFile[];
+    if (!files || files.length === 0) {
+      throw new AppError("No files uploaded", 400, "MISSING_FILES");
     }
 
-    uploadedFilePath = file.path;
+    const jobResults: any[] = [];
 
-    console.log('=== FILE UPLOAD START ===');
-    console.log('Original name:', file.originalname);
-    console.log('File path:', file.path);
-    console.log('File size:', file.size);
-    console.log('MIME type:', file.mimetype);
-    console.log('==========================');
+    for (const file of files) {
+      uploadedFilePaths.push(file.path);
 
-    // Validate file
-    await FileValidationService.validateFile({
-      path: file.path,
-      originalName: file.originalname,
-      size: file.size,
-      mimeType: file.mimetype,
-    });
+      console.log("=== FILE UPLOAD START ===");
+      console.log("Original name:", file.originalname);
+      console.log("File path:", file.path);
+      console.log("File size:", file.size);
+      console.log("MIME type:", file.mimetype);
+      console.log("=========================");
 
-    console.log('✅ File validation passed');
+      // ✅ Validate file
+      await FileValidationService.validateFile({
+        path: file.path,
+        originalName: file.originalname,
+        size: file.size,
+        mimeType: file.mimetype,
+      });
+      console.log("✅ File validation passed");
 
-    // Parse operations
-    let operations: ImageOperations | undefined;
-    if (req.body.operations) {
-      try {
-        const rawOps = typeof req.body.operations === "string" 
-          ? JSON.parse(req.body.operations) 
-          : req.body.operations;
-        
-        console.log('Raw operations:', rawOps);
-        
-        const parsedOps = operationsSchema.parse(rawOps);
-        operations = parsedOps as ImageOperations;
+      // ✅ Parse operations (if provided)
+      let operations: ImageOperations | undefined;
+      if (req.body.operations) {
+        try {
+          const rawOps =
+            typeof req.body.operations === "string"
+              ? JSON.parse(req.body.operations)
+              : req.body.operations;
 
-        console.log('✅ Operations parsed:', operations);
+          console.log("Raw operations:", rawOps);
 
-        await validateImageOperations(operations, {
-          fileSize: file.size,
-          mimeType: file.mimetype,
-          fileName: file.originalname,
-        });
+          const parsedOps = operationsSchema.parse(rawOps);
+          operations = parsedOps as ImageOperations;
 
-        console.log('✅ Operations validation passed');
-      } catch (err) {
-        console.error('❌ Operations parsing/validation failed:', err);
-        await cleanUploadedFile(file.path);
-        
-        if (err instanceof ZodError) {
-          throw new AppError("Invalid image operations", 400, "INVALID_OPERATIONS", {
-            validationErrors: err.issues.map((i) => ({
-              field: i.path.join("."),
-              message: i.message,
-            })),
+          console.log("✅ Operations parsed:", operations);
+
+          await validateImageOperations(operations, {
+            fileSize: file.size,
+            mimeType: file.mimetype,
+            fileName: file.originalname,
           });
+
+          console.log("✅ Operations validation passed");
+        } catch (err) {
+          console.error("❌ Operations parsing/validation failed:", err);
+          await cleanUploadedFile(file.path);
+
+          if (err instanceof ZodError) {
+            throw new AppError(
+              "Invalid image operations",
+              400,
+              "INVALID_OPERATIONS",
+              {
+                validationErrors: err.issues.map((i) => ({
+                  field: i.path.join("."),
+                  message: i.message,
+                })),
+              }
+            );
+          }
+          throw new AppError(
+            "Invalid operations format",
+            400,
+            "OPERATIONS_PARSE_ERROR"
+          );
         }
-        throw new AppError("Invalid operations format", 400, "OPERATIONS_PARSE_ERROR");
       }
-    }
 
-    // Build job payload
-    const payload: ImageJobPayload = {
-      filePath: path.resolve(file.path),
-      originalName: file.originalname,
-      fileSize: file.size,
-      mimeType: file.mimetype,
-      uploadedAt: new Date(),
-      operations,
-    };
+      // ✅ Build job payload
+      const payload: ImageJobPayload = {
+        filePath: path.resolve(file.path),
+        originalName: file.originalname,
+        fileSize: file.size,
+        mimeType: file.mimetype,
+        uploadedAt: new Date(),
+        operations,
+      };
 
-    console.log('✅ Job payload created:', {
-      filePath: payload.filePath,
-      originalName: payload.originalName,
-      fileSize: payload.fileSize,
-      operations: operations ? Object.keys(operations) : [],
-    });
+      console.log("✅ Job payload created:", {
+        filePath: payload.filePath,
+        originalName: payload.originalName,
+        fileSize: payload.fileSize,
+        operations: operations ? Object.keys(operations) : [],
+      });
 
-    // Job priority
-    const priority = ImageConfigUtils.determineJobPriority(
-      file.size,
-      operations ? Object.keys(operations).length : 0
-    );
+      // ✅ Job priority
+      const priority = ImageConfigUtils.determineJobPriority(
+        file.size,
+        operations ? Object.keys(operations).length : 0
+      );
 
-    console.log('Job priority determined:', priority);
+      console.log("Job priority determined:", priority);
 
-    // Create job - NO REFERENCE COUNTING
-    const jobId = `img-${Date.now()}-${uuidv4()}`;
-    
-    const job = await imageQueue.add(ImageJobType.PROCESS_IMAGE, payload, {
-      jobId,
-      priority:
-        priority === "high"
-          ? JobPriority.HIGH
-          : priority === "low"
-          ? JobPriority.LOW
-          : JobPriority.NORMAL,
-      attempts: 3,
-      backoff: { 
-        type: "exponential", 
-        delay: IMAGE_CONFIG.WORKER.TIMEOUTS.RETRY_DELAY 
-      },
-      removeOnComplete: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_COMPLETED_JOBS,
-      removeOnFail: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_FAILED_JOBS,
-    });
+      // ✅ Create job
+      const jobId = `img-${Date.now()}-${uuidv4()}`;
+      const job = await imageQueue.add(ImageJobType.PROCESS_IMAGE, payload, {
+        jobId,
+        priority:
+          priority === "high"
+            ? JobPriority.HIGH
+            : priority === "low"
+            ? JobPriority.LOW
+            : JobPriority.NORMAL,
+        attempts: 3,
+        backoff: {
+          type: "exponential",
+          delay: IMAGE_CONFIG.WORKER.TIMEOUTS.RETRY_DELAY,
+        },
+        removeOnComplete: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_COMPLETED_JOBS,
+        removeOnFail: IMAGE_CONFIG.WORKER.QUEUE_LIMITS.MAX_FAILED_JOBS,
+      });
 
-    console.log('✅ Job created successfully:', job.id);
+      console.log("✅ Job created successfully:", job.id);
 
-    logger.info("Image processing job enqueued", {
-      jobId: job.id,
-      requestId,
-      filename: file.originalname,
-      fileSize: file.size,
-      operations: operations ? Object.keys(operations) : [],
-      priority,
-      time: Date.now() - startTime,
-    });
+      logger.info("Image processing job enqueued", {
+        jobId: job.id,
+        requestId,
+        filename: file.originalname,
+        fileSize: file.size,
+        operations: operations ? Object.keys(operations) : [],
+        priority,
+        time: Date.now() - startTime,
+      });
 
-    console.log('=== UPLOAD COMPLETED ===');
-    console.log('Job ID:', job.id);
-    console.log('File will be processed and cleaned up automatically');
-    console.log('========================');
+      console.log("=== UPLOAD COMPLETED ===");
+      console.log("Job ID:", job.id);
+      console.log("File will be processed and cleaned up automatically");
+      console.log("========================");
 
-    res.status(202).json({
-      success: true,
-      message: "File uploaded and queued for processing",
-      data: {
+      jobResults.push({
         jobId: job.id,
         fileName: file.originalname,
         estimatedProcessingTime: ImageConfigUtils.estimateProcessingTime(
@@ -252,20 +261,28 @@ export async function handleUpload(
         ),
         queuePosition: await getQueuePosition(job.id as string),
         priority,
-      },
+      });
+    }
+
+    // ✅ Respond with all jobs
+    res.status(202).json({
+      success: true,
+      message: "Files uploaded and queued for processing",
+      data: jobResults,
     });
   } catch (error) {
-    console.error('❌ Upload failed:', error);
-    
-    // Cleanup uploaded file on error
-    if (uploadedFilePath) {
-      await cleanUploadedFile(uploadedFilePath);
-      console.log('🧹 Cleaned up uploaded file due to error');
+    console.error("❌ Upload failed:", error);
+
+    // Cleanup uploaded files on error
+    for (const filePath of uploadedFilePaths) {
+      await cleanUploadedFile(filePath);
+      console.log("🧹 Cleaned up uploaded file due to error:", filePath);
     }
-    
+
     next(error);
   }
 }
+
 
 /* ------------------- Validation Helper ------------------- */
 async function validateImageOperations(
@@ -472,6 +489,7 @@ imageRouter.get("/job/:jobId", async (req, res) => {
     });
   }
 });
+
 
 // Queue management endpoints
 imageRouter.post("/queue/clean", async (req, res) => {

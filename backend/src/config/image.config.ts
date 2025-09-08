@@ -11,7 +11,7 @@ export const IMAGE_CONFIG = {
   UPLOAD_DIR,
   PROCESSED_DIR, // Guaranteed string
   FILE_LIMITS: {
-    MAX_SIZE: 50 * 1024 * 1024, // 50MB
+    MAX_SIZE: 100 * 1024 * 1024, // 100MB
     MIN_SIZE: 100, // 100 bytes
     MAX_FILENAME_LENGTH: 255,
   },

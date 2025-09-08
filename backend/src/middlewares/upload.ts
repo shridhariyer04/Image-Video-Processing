@@ -191,7 +191,7 @@ export const upload = multer({
   fileFilter,
   limits: {
     fileSize: MAX_FILE_SIZE_BYTES || IMAGE_CONFIG.FILE_LIMITS.MAX_SIZE,
-    files: 1, // Only allow single file upload
+    files: 5, // Only allow single file upload
     fields: 10, // Limit form fields
     fieldNameSize: 100,
     fieldSize: 1024 * 10, // 10KB for form fields

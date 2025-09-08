@@ -37,6 +37,15 @@ export interface ProcessingOptions {
   quality?: number;
   preserveMetadata?: boolean;
 }
+export interface WatermarkOptions {
+  type: 'text' | 'image';
+  text?: string;
+  imagePath?: string;
+  opacity: number;
+  gravity: string;
+  fontSize?: number;  
+  color?: string;     
+}
 
 export class ImageProcessor {
   private static readonly MAX_DIMENSION = 10000;
@@ -356,122 +365,289 @@ export class ImageProcessor {
 
   // NEW: Enhanced watermark support
   private static async applyWatermark(
-    pipeline: Sharp, 
-    watermark: NonNullable<ImageOperations['watermark']>
-  ): Promise<Sharp> {
-    try {
-      if (watermark.type==="text") {
-        return await this.applyTextWatermark(pipeline, watermark);
-      } else if (watermark.type === "image") {
-        return await this.applyImageWatermark(pipeline, watermark);
-      }
-    } catch (error) {
-      logger.warn('Watermark application failed, continuing without watermark:', error);
+  pipeline: Sharp, 
+  watermark: NonNullable<ImageOperations['watermark']>
+): Promise<Sharp> {
+  try {
+    if (watermark.type === "text") {
+      return await this.applyTextWatermark(pipeline, watermark);
+    } else if (watermark.type === "image") {
+      return await this.applyImageWatermark(pipeline, watermark);
+    }
+  } catch (error) {
+    logger.warn('Watermark application failed, continuing without watermark:', error);
+  }
+  
+  return pipeline;
+}
+
+// Fixed text watermark method
+private static async applyTextWatermark(
+  pipeline: Sharp, 
+  watermark: NonNullable<ImageOperations['watermark']>
+): Promise<Sharp> {
+  if (watermark.type !== "text" || !watermark.text) return pipeline;
+
+  const metadata = await pipeline.metadata();
+  const width = metadata.width || 800;
+  const height = metadata.height || 600;
+  
+  // Use custom font size or calculate based on image
+  const fontSize = watermark.fontSize || Math.max(16, Math.min(72, Math.floor(width / 30)));
+  const opacity = Math.max(0.1, Math.min(1, watermark.opacity || 0.5));
+  const color = watermark.color || '#ffffff';
+  
+  // Get position coordinates - FIXED
+  const position = this.getTextWatermarkPosition(watermark.gravity || 'bottom-right', width, height, fontSize);
+  
+  // Create SVG text watermark with proper positioning - FIXED
+  const textSvg = `
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <filter id="shadow">
+          <feDropShadow dx="2" dy="2" stdDeviation="2" flood-opacity="${opacity * 0.5}"/>
+        </filter>
+      </defs>
+      <text x="${position.x}" y="${position.y}" 
+            font-family="Arial, sans-serif" 
+            font-size="${fontSize}px" 
+            font-weight="bold"
+            fill="${color}" 
+            fill-opacity="${opacity}"
+            text-anchor="${position.anchor}" 
+            dominant-baseline="${position.baseline}"
+            filter="url(#shadow)">
+        ${this.escapeXmlText(watermark.text)}
+      </text>
+    </svg>
+  `;
+  
+  const textBuffer = Buffer.from(textSvg);
+  
+  return pipeline.composite([{
+    input: textBuffer,
+    blend: 'over'
+  }]);
+}
+
+// FIXED positioning method
+private static getTextWatermarkPosition(
+  gravity: string, 
+  width: number, 
+  height: number, 
+  fontSize: number
+): { x: number; y: number; anchor: string; baseline: string } {
+  const margin = Math.max(20, fontSize * 0.5); // Dynamic margin based on font size
+  
+  switch (gravity) {
+    case 'top-left':
+      return { 
+        x: margin, 
+        y: margin + fontSize, 
+        anchor: 'start', 
+        baseline: 'text-before-edge' 
+      };
+    case 'top':
+      return { 
+        x: width / 2, 
+        y: margin + fontSize, 
+        anchor: 'middle', 
+        baseline: 'text-before-edge' 
+      };
+    case 'top-right':
+      return { 
+        x: width - margin, 
+        y: margin + fontSize, 
+        anchor: 'end', 
+        baseline: 'text-before-edge' 
+      };
+    case 'left':
+      return { 
+        x: margin, 
+        y: height / 2, 
+        anchor: 'start', 
+        baseline: 'central' 
+      };
+    case 'center':
+      return { 
+        x: width / 2, 
+        y: height / 2, 
+        anchor: 'middle', 
+        baseline: 'central' 
+      };
+    case 'right':
+      return { 
+        x: width - margin, 
+        y: height / 2, 
+        anchor: 'end', 
+        baseline: 'central' 
+      };
+    case 'bottom-left':
+      return { 
+        x: margin, 
+        y: height - margin, 
+        anchor: 'start', 
+        baseline: 'text-after-edge' 
+      };
+    case 'bottom':
+      return { 
+        x: width / 2, 
+        y: height - margin, 
+        anchor: 'middle', 
+        baseline: 'text-after-edge' 
+      };
+    case 'bottom-right':
+    default:
+      return { 
+        x: width - margin, 
+        y: height - margin, 
+        anchor: 'end', 
+        baseline: 'text-after-edge' 
+      };
+  }
+}
+
+// NEW: Add XML text escaping method
+private static escapeXmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// FIXED color conversion method
+private static hexToRgb(hex: string): string {
+  // Remove # if present
+  hex = hex.replace('#', '');
+  
+  // Handle shorthand hex (e.g., "fff" -> "ffffff")
+  if (hex.length === 3) {
+    hex = hex.split('').map(char => char + char).join('');
+  }
+  
+  // Default to white if invalid
+  if (hex.length !== 6 || !/^[0-9A-Fa-f]+$/.test(hex)) {
+    return '255,255,255';
+  }
+  
+  // Convert to RGB
+  const r = parseInt(hex.substring(0, 2), 16);
+  const g = parseInt(hex.substring(2, 4), 16);
+  const b = parseInt(hex.substring(4, 6), 16);
+  
+  return `${r},${g},${b}`;
+}
+
+// UPDATED image watermark method (also fixed)
+private static async applyImageWatermark(
+  pipeline: Sharp, 
+  watermark: NonNullable<ImageOperations['watermark']>
+): Promise<Sharp> {
+  if (watermark.type !== "image" || !watermark.imagePath) return pipeline;
+
+  try {
+    // Check if watermark image exists
+    await fs.access(watermark.imagePath);
+    
+    const metadata = await pipeline.metadata();
+    const mainWidth = metadata.width || 800;
+    const mainHeight = metadata.height || 600;
+    
+    // Resize watermark to 15% of main image (smaller for better appearance)
+    const maxWatermarkSize = Math.min(mainWidth, mainHeight) * 0.15;
+    const opacity = Math.max(0.1, Math.min(1, watermark.opacity || 0.7));
+    
+    // Get watermark metadata to preserve aspect ratio
+    const watermarkMeta = await sharp(watermark.imagePath).metadata();
+    const aspectRatio = (watermarkMeta.width || 1) / (watermarkMeta.height || 1);
+    
+    let watermarkWidth, watermarkHeight;
+    if (aspectRatio > 1) {
+      // Landscape
+      watermarkWidth = maxWatermarkSize;
+      watermarkHeight = Math.round(maxWatermarkSize / aspectRatio);
+    } else {
+      // Portrait or square
+      watermarkHeight = maxWatermarkSize;
+      watermarkWidth = Math.round(maxWatermarkSize * aspectRatio);
     }
     
-    return pipeline;
-  }
-
-  // NEW: Text watermark
-  private static async applyTextWatermark(
-    pipeline: Sharp, 
-    watermark: NonNullable<ImageOperations['watermark']>
-  ): Promise<Sharp> {
-    if (watermark.type!=="text") return pipeline;
-
-    const metadata = await pipeline.metadata();
-    const width = metadata.width || 800;
-    const height = metadata.height || 600;
+    const watermarkBuffer = await sharp(watermark.imagePath)
+      .resize(watermarkWidth, watermarkHeight, { fit: 'inside' })
+      .composite([{
+        input: Buffer.from([255, 255, 255, Math.round(255 * (1 - opacity))]),
+        raw: { width: 1, height: 1, channels: 4 },
+        tile: true,
+        blend: 'dest-in'
+      }])
+      .png()
+      .toBuffer();
     
-    // Calculate font size based on image dimensions
-    const fontSize = Math.max(12, Math.min(72, Math.floor(width / 20)));
-    const opacity = Math.max(0.1, Math.min(1, watermark.opacity || 0.5));
-    
-    // Create SVG text watermark
-    const textSvg = `
-      <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-        <text x="50%" y="50%" 
-              font-family="Arial, sans-serif" 
-              font-size="${fontSize}px" 
-              fill="rgba(255,255,255,${opacity})" 
-              stroke="rgba(0,0,0,${opacity * 0.5})" 
-              stroke-width="1"
-              text-anchor="middle" 
-              dominant-baseline="middle">
-          ${watermark.text}
-        </text>
-      </svg>
-    `;
-    
-    const textBuffer = Buffer.from(textSvg);
-    const position = this.getWatermarkPosition(watermark.gravity || 'center');
+    const position = this.getImageWatermarkPosition(
+      watermark.gravity || 'bottom-right',
+      mainWidth,
+      mainHeight,
+      watermarkWidth,
+      watermarkHeight
+    );
     
     return pipeline.composite([{
-      input: textBuffer,
+      input: watermarkBuffer,
       ...position,
       blend: 'over'
     }]);
+  } catch (error) {
+    logger.warn('Image watermark file not found or invalid:', watermark.imagePath);
+    return pipeline;
   }
+}
 
-  // NEW: Image watermark
-  private static async applyImageWatermark(
-    pipeline: Sharp, 
-    watermark: NonNullable<ImageOperations['watermark']>
-  ): Promise<Sharp> {
-    if (watermark.type!=="image") return pipeline;
-
-    try {
-      // Check if watermark image exists
-      await fs.access(watermark.imagePath);
-      
-      const metadata = await pipeline.metadata();
-      const mainWidth = metadata.width || 800;
-      const mainHeight = metadata.height || 600;
-      
-      // Resize watermark to 20% of main image
-      const watermarkSize = Math.min(mainWidth, mainHeight) * 0.2;
-      const opacity = Math.max(0.1, Math.min(1, watermark.opacity || 0.7));
-      
-      const watermarkBuffer = await sharp(watermark.imagePath)
-        .resize(watermarkSize, watermarkSize, { fit: 'inside' })
-        .composite([{
-          input: Buffer.from([255, 255, 255, Math.round(255 * (1 - opacity))]),
-          raw: { width: 1, height: 1, channels: 4 },
-          tile: true,
-          blend: 'dest-in'
-        }])
-        .png()
-        .toBuffer();
-      
-      const position = this.getWatermarkPosition(watermark.gravity || 'bottom-right');
-      
-      return pipeline.composite([{
-        input: watermarkBuffer,
-        ...position,
-        blend: 'over'
-      }]);
-    } catch (error) {
-      logger.warn('Image watermark file not found or invalid:', watermark.imagePath);
-      return pipeline;
-    }
+// UPDATED image watermark positioning helper
+private static getImageWatermarkPosition(
+  gravity: string,
+  mainWidth: number,
+  mainHeight: number,
+  watermarkWidth: number,
+  watermarkHeight: number
+): { top?: number; left?: number; gravity?: string } {
+  const margin = 20;
+  
+  switch (gravity) {
+    case 'top-left':
+      return { top: margin, left: margin };
+    case 'top':
+      return { top: margin, left: Math.round((mainWidth - watermarkWidth) / 2) };
+    case 'top-right':
+      return { top: margin, left: mainWidth - watermarkWidth - margin };
+    case 'left':
+      return { top: Math.round((mainHeight - watermarkHeight) / 2), left: margin };
+    case 'center':
+      return { 
+        top: Math.round((mainHeight - watermarkHeight) / 2), 
+        left: Math.round((mainWidth - watermarkWidth) / 2) 
+      };
+    case 'right':
+      return { 
+        top: Math.round((mainHeight - watermarkHeight) / 2), 
+        left: mainWidth - watermarkWidth - margin 
+      };
+    case 'bottom-left':
+      return { top: mainHeight - watermarkHeight - margin, left: margin };
+    case 'bottom':
+      return { 
+        top: mainHeight - watermarkHeight - margin, 
+        left: Math.round((mainWidth - watermarkWidth) / 2) 
+      };
+    case 'bottom-right':
+    default:
+      return { 
+        top: mainHeight - watermarkHeight - margin, 
+        left: mainWidth - watermarkWidth - margin 
+      };
   }
-
-  // NEW: Watermark positioning helper
-  private static getWatermarkPosition(position: string): { top?: number; left?: number; gravity?: string } {
-    switch (position) {
-      case 'top-left':
-        return { top: 10, left: 10 };
-      case 'top-right':
-        return { gravity: 'northeast' };
-      case 'bottom-left':
-        return { gravity: 'southwest' };
-      case 'bottom-right':
-        return { gravity: 'southeast' };
-      case 'center':
-      default:
-        return { gravity: 'center' };
-    }
-  }
+}
 
   private static applyRotation(pipeline: Sharp, degrees: number): Sharp {
     const normalizedDegrees = degrees % 360;
