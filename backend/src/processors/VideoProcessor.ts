@@ -131,6 +131,9 @@ export class VideoProcessor {
         },
       };
 
+      const finalUrl = await StorageService.saveProcessedFile(processedPath, path.basename(processedPath), 'video');
+    result.outputPath = finalUrl
+
       console.log('✅ Video processing completed successfully');
       console.log('📊 Result summary:', {
         outputPath: result.outputPath,

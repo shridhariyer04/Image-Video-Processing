@@ -15,6 +15,7 @@ import logger from "../utils/logger";
 import { AppError } from "../utils/error";
 import { FileValidationService } from "../service/validationservice";
 import { ImageConfigUtils, IMAGE_CONFIG } from "../config/image.config";
+import { upload } from '../middlewares/upload';
 
 /* ------------------- Multer Setup ------------------- */
 const upload = multer({ dest: "uploads/" });

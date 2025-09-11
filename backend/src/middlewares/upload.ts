@@ -9,7 +9,7 @@ import logger from '../utils/logger';
 import { AppError } from '../utils/error';
 import { FileValidationService } from '../service/validationservice';
 import { IMAGE_CONFIG } from '../config/image.config';
-
+import { getCloudinaryImageStorage } from '../utils/Cloudinary-Storage.ts';
 /**
  * Initialize upload directory with proper permissions
  */
@@ -48,50 +48,7 @@ const sanitizeFilename = (filename: string): string => {
 /**
  * Enhanced storage configuration using centralized validation
  */
-const storage = multer.diskStorage({
-  destination: (_req: Request, _file: Express.Multer.File, cb) => {
-    try {
-      // Ensure directory exists for each request
-      if (!fs.existsSync(UPLOAD_DIR)) {
-        fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o755 });
-      }
-      cb(null, UPLOAD_DIR);
-    } catch (error) {
-      logger.error('Destination setup failed', error);
-      cb(new AppError('Upload destination unavailable', 500, 'DESTINATION_ERROR'), '');
-    }
-  },
-
-  filename: (_req: Request, file: Express.Multer.File, cb) => {
-    try {
-      const ext = path.extname(file.originalname).toLowerCase();
-      const baseName = path.basename(file.originalname, ext);
-      
-      // Use local filename sanitization
-      const sanitizedBase = sanitizeFilename(baseName);
-
-      // Generate cryptographically secure random string
-      const randomHash = crypto.randomBytes(8).toString('hex');
-      
-      // Create timestamp with milliseconds for uniqueness
-      const timestamp = Date.now();
-      
-      // Construct final filename
-      const finalName = `${timestamp}-${randomHash}-${sanitizedBase}${ext}`;
-      
-      logger.debug('Generated filename:', {
-        original: file.originalname,
-        sanitized: finalName,
-        size: file.size
-      });
-
-      cb(null, finalName);
-    } catch (error) {
-      logger.error('Filename generation failed', error);
-      cb(new AppError('Filename generation failed', 500, 'FILENAME_ERROR'), '');
-    }
-  }
-});
+const storage = getCloudinaryImageStorage();
 
 /**
  * Enhanced file filter using centralized validation

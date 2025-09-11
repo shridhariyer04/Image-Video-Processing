@@ -6,6 +6,8 @@ import { IMAGE_CONFIG } from '../config/image.config';
 import logger from '../utils/logger';
 import { AppError } from '../utils/error';
 import { performance } from 'perf_hooks';
+import { StorageService } from '../service/storage-service';
+
 
 // Sharp configuration for optimal performance
 sharp.cache({ memory: 256 });
@@ -165,6 +167,9 @@ export class ImageProcessor {
           colorspace: finalMetadata.space || 'unknown',
         },
       };
+
+      const finalUrl = await StorageService.saveProcessedFile(outputPath, path.basename(outputPath), 'image');
+    result.outputPath = finalUrl; // Update the result with the final URL
       
       logger.info('Image processed successfully:', {
         inputFile: path.basename(options.inputPath),

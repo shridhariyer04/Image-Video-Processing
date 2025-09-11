@@ -24,6 +24,7 @@ maxLoadingTimeout: 5000,
   enableReadyCheck: true,
   maxRetriesPerRequest: NODE_ENV === 'production' ? 3 : null,
   // Connection pool settings
+  tls: {},
   family: 4, // IPv4
   compression:'gzip',
 } as RedisOptions& Record<string,any>

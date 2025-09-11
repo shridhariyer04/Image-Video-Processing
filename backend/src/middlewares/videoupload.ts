@@ -8,6 +8,7 @@ import { NODE_ENV } from '../config/env';
 import logger from '../utils/logger';
 import { AppError } from '../utils/error';
 import { VideoFileValidationService } from '../service/videovalidationservice';
+import { getCloudinaryVideoStorage } from '../utils/Cloudinary-Storage.ts';
 
 // Video-specific configuration
 const VIDEO_CONFIG = {
@@ -91,50 +92,7 @@ const sanitizeVideoFilename = (filename: string): string => {
 /**
  * Video storage configuration
  */
-const videoStorage = multer.diskStorage({
-  destination: (_req: Request, _file: Express.Multer.File, cb) => {
-    try {
-      // Ensure directory exists for each request
-      if (!fs.existsSync(VIDEO_UPLOAD_DIR)) {
-        fs.mkdirSync(VIDEO_UPLOAD_DIR, { recursive: true, mode: 0o755 });
-      }
-      cb(null, VIDEO_UPLOAD_DIR);
-    } catch (error) {
-      logger.error('Video destination setup failed', error);
-      cb(new AppError('Video upload destination unavailable', 500, 'VIDEO_DESTINATION_ERROR'), '');
-    }
-  },
-
-  filename: (_req: Request, file: Express.Multer.File, cb) => {
-    try {
-      const ext = path.extname(file.originalname).toLowerCase();
-      const baseName = path.basename(file.originalname, ext);
-      
-      // Use video-specific filename sanitization
-      const sanitizedBase = sanitizeVideoFilename(baseName);
-
-      // Generate cryptographically secure random string
-      const randomHash = crypto.randomBytes(12).toString('hex'); // Longer hash for videos
-      
-      // Create timestamp with milliseconds for uniqueness
-      const timestamp = Date.now();
-      
-      // Construct final filename with video prefix
-      const finalName = `video-${timestamp}-${randomHash}-${sanitizedBase}${ext}`;
-      
-      logger.debug('Generated video filename:', {
-        original: file.originalname,
-        sanitized: finalName,
-        size: file.size
-      });
-
-      cb(null, finalName);
-    } catch (error) {
-      logger.error('Video filename generation failed', error);
-      cb(new AppError('Video filename generation failed', 500, 'VIDEO_FILENAME_ERROR'), '');
-    }
-  }
-});
+const videoStorage = getCloudinaryVideoStorage();
 
 /**
  * Video file filter with comprehensive validation

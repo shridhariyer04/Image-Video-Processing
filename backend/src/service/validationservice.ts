@@ -241,8 +241,6 @@ private static isConversionSUpported(fromMimeType:string, toFormat:string):boole
     }
   }
 
-  
-
   /**
    * Validate file header matches MIME type
    */
